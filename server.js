@@ -1,19 +1,43 @@
 // No2Dowry.com — backend API (single-file deploy build).
-// Everything inlined: store, auth, shield, matchmaking, routes. Auto-seeds on boot.
-// Data is in-memory (resets on restart) — fine for a live preview. Swap for PostgreSQL for production.
+// Storage: PostgreSQL when DATABASE_URL is set (data PERSISTS across restarts);
+// otherwise an in-memory store (data resets on restart — fine for local/demo).
+// Everything inlined: store, auth, shield, matchmaking, routes.
 import express from 'express'
 import cors from 'cors'
 import crypto from 'crypto'
+import pg from 'pg'
 
 const SECRET = process.env.NO2DOWRY_SECRET || 'dev-secret-change-me'
+const DATABASE_URL = process.env.DATABASE_URL || ''
 
-/* ---------------- in-memory store ---------------- */
+/* ---------------- store (in-memory, optionally backed by Postgres) ---------------- */
 const DB = { users: [], profiles: [], otps: [], connections: [], conversations: [], messages: [], videoDates: [], reports: [], subscriptions: [], familyInvites: [], bestieInvites: [] }
 const uuid = () => crypto.randomUUID()
 const find = (c, fn) => DB[c].find(fn)
 const filter = (c, fn) => DB[c].filter(fn)
-const insert = (c, row) => { DB[c].push(row); return row }
-const update = (c, id, patch) => { const r = DB[c].find((x) => x.id === id); if (r) Object.assign(r, patch); return r }
+const insert = (c, row) => { DB[c].push(row); persist(c, row); return row }
+const update = (c, id, patch) => { const r = DB[c].find((x) => x.id === id); if (r) { Object.assign(r, patch); persist(c, r) } return r }
+
+// Postgres persistence: load all rows on boot, write-through on every insert/update.
+// Uses a simple key-value table (collection,id,jsonb) so it mirrors the in-memory store exactly.
+let pool = null
+let pgReady = false
+function persist(coll, row) {
+  if (!pgReady) return
+  pool.query(
+    'INSERT INTO kv(collection,id,data) VALUES($1,$2,$3) ON CONFLICT (collection,id) DO UPDATE SET data=$3',
+    [coll, String(row.id), row]
+  ).catch((e) => console.error('persist error:', e.message))
+}
+async function initStore() {
+  if (!DATABASE_URL) { console.log('No DATABASE_URL — using in-memory store (data resets on restart).'); return }
+  pool = new pg.Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 5 })
+  await pool.query('CREATE TABLE IF NOT EXISTS kv (collection text NOT NULL, id text NOT NULL, data jsonb NOT NULL, PRIMARY KEY (collection, id))')
+  const res = await pool.query('SELECT collection, id, data FROM kv')
+  for (const r of res.rows) { if (DB[r.collection]) DB[r.collection].push(r.data) }
+  pgReady = true
+  console.log('Connected to Postgres — loaded ' + res.rows.length + ' rows.')
+}
 
 /* ---------------- seed sample members ---------------- */
 function seed() {
@@ -29,7 +53,6 @@ function seed() {
     insert('profiles', { id: uuid(), user_id: id, display_name: s.name, age: s.age, city: s.city, occupation: s.occupation, interests: s.interests, values_quiz: s.vq, prompts: s.prompts, kundli: s.kundli })
   }
 }
-seed()
 
 /* ---------------- auth ---------------- */
 function issueToken(userId) {
@@ -95,7 +118,7 @@ app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); res.
 
 const inConvo = (c, uid) => c && (c.user_a === uid || c.user_b === uid)
 
-app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '1.0.0', time: new Date().toISOString() }))
+app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '1.1.0', storage: pgReady ? 'postgres' : 'memory', time: new Date().toISOString() }))
 
 app.post('/v1/auth/otp', (req, res) => {
   const { phone } = req.body || {}
@@ -265,4 +288,10 @@ app.use((req, res) => res.status(404).json({ error: 'Not found', path: req.origi
 app.use((err, req, res, next) => { console.error(err); res.status(500).json({ error: 'Server error' }) })
 
 const PORT = process.env.PORT || 4000
-app.listen(PORT, () => console.log('No2Dowry API v1.0.0 on port ' + PORT))
+async function start() {
+  try { await initStore() } catch (e) { console.error('Postgres init failed, continuing in-memory:', e.message) }
+  if (DB.users.length === 0) { seed(); console.log('Seeded sample members.') }
+  else console.log('Loaded ' + DB.users.length + ' existing users; skipping seed.')
+  app.listen(PORT, () => console.log('No2Dowry API v1.1.0 on port ' + PORT + (pgReady ? ' (Postgres — persistent)' : ' (in-memory)')))
+}
+start()
