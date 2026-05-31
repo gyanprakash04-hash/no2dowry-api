@@ -30,7 +30,7 @@ const PUSH_LIVE = !!(webpush && VAPID_PUBLIC && VAPID_PRIVATE)
 if (PUSH_LIVE) { try { webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC, VAPID_PRIVATE) } catch (e) { console.error('VAPID setup failed:', e.message) } }
 
 /* ---------------- store (in-memory, optionally backed by Postgres) ---------------- */
-const DB = { users: [], profiles: [], otps: [], connections: [], conversations: [], messages: [], videoDates: [], reports: [], subscriptions: [], familyInvites: [], bestieInvites: [], blocks: [], modActions: [], notifications: [], pushSubs: [], events: [], errors: [] }
+const DB = { users: [], profiles: [], otps: [], connections: [], conversations: [], messages: [], videoDates: [], reports: [], subscriptions: [], familyInvites: [], bestieInvites: [], blocks: [], modActions: [], notifications: [], pushSubs: [], events: [], errors: [], verifications: [] }
 const uuid = () => crypto.randomUUID()
 const find = (c, fn) => DB[c].find(fn)
 const filter = (c, fn) => DB[c].filter(fn)
@@ -77,7 +77,7 @@ function seed() {
   ]
   for (const s of samples) {
     const id = uuid()
-    insert('users', { id, phone: '+91-seed-' + s.name, created_at: new Date().toISOString(), pledge_taken_at: new Date().toISOString(), verification_status: 'verified', trust_score: 84, is_premium: false, status: 'active', slow_mode: false, is_sample: true })
+    insert('users', { id, phone: '+91-seed-' + s.name, created_at: new Date().toISOString(), pledge_taken_at: new Date().toISOString(), verification_status: 'verified', phone_verified: true, trust_score: 84, is_premium: false, status: 'active', slow_mode: false, is_sample: true })
     insert('profiles', { id: uuid(), user_id: id, display_name: s.name, age: s.age, city: s.city, occupation: s.occupation, interests: s.interests, values_quiz: s.vq, prompts: s.prompts, kundli: s.kundli })
   }
 }
@@ -261,7 +261,7 @@ app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); res.
 
 const inConvo = (c, uid) => c && (c.user_a === uid || c.user_b === uid)
 
-app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '1.8.0-admin', storage: pgReady ? 'postgres' : 'memory', otp: OTP_LIVE ? 'live' : 'demo', push: PUSH_LIVE ? 'on' : 'off', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
+app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '1.9.0-verify', storage: pgReady ? 'postgres' : 'memory', otp: OTP_LIVE ? 'live' : 'demo', push: PUSH_LIVE ? 'on' : 'off', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
 
 // ---- OTP provider: MSG91 (WhatsApp primary + SMS fallback) with demo fallback ----
 // Set these env vars to go live: MSG91_AUTHKEY and MSG91_OTP_TEMPLATE_ID.
@@ -311,8 +311,9 @@ app.post('/v1/auth/verify', rateLimit(10, 60000), async (req, res) => {
   try { ok = await otpVerify(phone, code) } catch (e) { return res.status(502).json({ error: 'Verify failed: ' + e.message }) }
   if (!ok) return res.status(401).json({ error: 'Invalid code' })
   let user = find('users', (u) => u.phone === phone)
-  if (!user) user = insert('users', { id: uuid(), phone, created_at: new Date().toISOString(), pledge_taken_at: null, verification_status: 'pending', trust_score: 42, is_premium: false, status: 'active', slow_mode: false })
-  res.json({ ok: true, token: issueToken(user.id), user })
+  if (!user) user = insert('users', { id: uuid(), phone, created_at: new Date().toISOString(), pledge_taken_at: null, verification_status: 'unverified', phone_verified: true, phone_verified_at: new Date().toISOString(), trust_score: 42, is_premium: false, status: 'active', slow_mode: false })
+  else if (!user.phone_verified) update('users', user.id, { phone_verified: true, phone_verified_at: new Date().toISOString() })
+  res.json({ ok: true, token: issueToken(user.id), user: find('users', (u) => u.id === user.id) })
 })
 
 app.get('/v1/me', requireAuth, (req, res) => res.json({ ok: true, user: find('users', (u) => u.id === req.userId) }))
@@ -322,10 +323,24 @@ app.post('/v1/pledge', requireAuth, (req, res) => {
   update('users', u.id, { pledge_taken_at: new Date().toISOString(), trust_score: Math.min(100, u.trust_score + 12) })
   res.json({ ok: true, user: u })
 })
-app.post('/v1/verification/start', requireAuth, (req, res) => {
+// Submit a selfie for human review. Selfie is a compressed data URL; stored only until reviewed.
+app.post('/v1/verification/selfie', requireAuth, rateLimit(5, 3600000), (req, res) => {
+  const { image } = req.body || {}
+  if (!image || typeof image !== 'string' || !/^data:image\/(jpeg|jpg|png|webp);base64,/.test(image)) {
+    return res.status(400).json({ error: 'A selfie image is required.' })
+  }
+  if (image.length > 700000) return res.status(413).json({ error: 'Image too large — please retake (it should compress automatically).' })
   const u = find('users', (x) => x.id === req.userId)
-  update('users', u.id, { verification_status: 'verified', trust_score: Math.min(100, u.trust_score + 20) })
-  res.json({ ok: true, user: u })
+  // clear any earlier pending verification for this user
+  const prior = filter('verifications', (v) => v.user_id === req.userId && v.status === 'pending')
+  for (const p of prior) { DB.verifications = DB.verifications.filter((x) => x.id !== p.id); if (pgReady) pool.query('DELETE FROM kv WHERE collection=$1 AND id=$2', ['verifications', String(p.id)]).catch(() => {}) }
+  const row = insert('verifications', { id: uuid(), user_id: req.userId, type: 'selfie', status: 'pending', selfie: image, created_at: new Date().toISOString() })
+  update('users', u.id, { verification_status: 'pending' })
+  res.json({ ok: true, status: 'pending', verification: { id: row.id, status: 'pending' } })
+})
+app.get('/v1/verification/status', requireAuth, (req, res) => {
+  const u = find('users', (x) => x.id === req.userId)
+  res.json({ ok: true, phone_verified: !!u.phone_verified, verification_status: u.verification_status || 'unverified', verified: u.verification_status === 'verified' })
 })
 // DPDP right-to-erasure: delete the member's account and their data (memory + Postgres).
 // Permanently remove a user and everything tied to them (profiles, connections,
@@ -385,7 +400,7 @@ app.get('/v1/profile/:userId', requireAuth, (req, res) => {
       notify(owner, { type: 'profile_view', title: '👀 Someone viewed your profile', body: 'A member just checked out your profile.', data: {} })
     }
   }
-  res.json({ ok: true, profile: { user_id: prof.user_id, display_name: prof.display_name, age: prof.age, city: prof.city, occupation: prof.occupation, interests: prof.interests || [], prompts: prof.prompts || [], kundli: prof.kundli || null, trust_score: u.trust_score, verified: u.verification_status === 'verified', pledged: !!u.pledge_taken_at } })
+  res.json({ ok: true, profile: { user_id: prof.user_id, display_name: prof.display_name, age: prof.age, city: prof.city, occupation: prof.occupation, interests: prof.interests || [], prompts: prof.prompts || [], kundli: prof.kundli || null, trust_score: u.trust_score, verified: u.verification_status === 'verified', phone_verified: !!u.phone_verified, pledged: !!u.pledge_taken_at } })
 })
 
 app.get('/v1/matches/today', requireAuth, (req, res) => {
@@ -653,7 +668,7 @@ app.get('/v1/admin/analytics', requireAdmin, (req, res) => {
   })
 })
 
-app.get('/v1/admin/stats', requireAdmin, (req, res) => res.json({ ok: true, users: DB.users.length, verified: filter('users', (u) => u.verification_status === 'verified').length, pledged: filter('users', (u) => u.pledge_taken_at).length, premium: filter('users', (u) => u.is_premium).length, connections: DB.connections.length, conversations: DB.conversations.length, videoDates: DB.videoDates.length, openReports: filter('reports', (r) => r.status === 'open').length, events: DB.events.length, errors: DB.errors.length }))
+app.get('/v1/admin/stats', requireAdmin, (req, res) => res.json({ ok: true, users: DB.users.length, verified: filter('users', (u) => u.verification_status === 'verified').length, pledged: filter('users', (u) => u.pledge_taken_at).length, premium: filter('users', (u) => u.is_premium).length, connections: DB.connections.length, conversations: DB.conversations.length, videoDates: DB.videoDates.length, openReports: filter('reports', (r) => r.status === 'open').length, pendingVerifications: filter('verifications', (v) => v.status === 'pending').length, events: DB.events.length, errors: DB.errors.length }))
 app.get('/v1/admin/flagged', requireAdmin, (req, res) => res.json({ ok: true, flaggedMessages: filter('messages', (m) => (m.shield_flags || []).length && !m.removed).map((m) => ({ id: m.id, sender: m.sender, body: m.body, flags: m.shield_flags, severity: m.shield_severity })), openReports: filter('reports', (r) => r.status === 'open') }))
 
 // helpers for moderation views
@@ -675,7 +690,8 @@ app.get('/v1/admin/users', requireAdmin, (req, res) => {
     const p = find('profiles', (x) => x.user_id === u.id)
     return {
       id: u.id, name: p ? p.display_name : null, phone: maskPhone(u.phone), city: p ? p.city : null,
-      verified: u.verification_status === 'verified', pledged: !!u.pledge_taken_at, premium: !!u.is_premium,
+      verified: u.verification_status === 'verified', verification_status: u.verification_status || 'unverified',
+      phone_verified: !!u.phone_verified, pledged: !!u.pledge_taken_at, premium: !!u.is_premium,
       trust_score: u.trust_score, status: u.status || 'active', completeness: p ? computeCompleteness(p) : 0,
       is_sample: !!u.is_sample, created_at: u.created_at,
     }
@@ -716,6 +732,35 @@ app.post('/v1/admin/users/:id/delete', requireAdmin, (req, res) => {
   purgeUser(u.id)
   insert('modActions', { id: uuid(), kind: 'delete_user', user_id: req.params.id, at: new Date().toISOString() })
   res.json({ ok: true, deleted: true })
+})
+
+// Verification review queue
+app.get('/v1/admin/verifications', requireAdmin, (req, res) => {
+  const pending = filter('verifications', (v) => v.status === 'pending')
+    .sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''))
+    .map((v) => ({ id: v.id, user_id: v.user_id, name: nameOf(v.user_id), selfie: v.selfie, created_at: v.created_at }))
+  res.json({ ok: true, verifications: pending })
+})
+app.post('/v1/admin/verifications/:id/approve', requireAdmin, (req, res) => {
+  const v = find('verifications', (x) => x.id === req.params.id)
+  if (!v) return res.status(404).json({ error: 'Verification not found' })
+  const u = find('users', (x) => x.id === v.user_id)
+  if (u) update('users', u.id, { verification_status: 'verified', verified_at: new Date().toISOString(), trust_score: Math.min(100, (u.trust_score || 42) + 20) })
+  // approved: keep status, DISCARD the selfie image (don't retain biometrics)
+  update('verifications', v.id, { status: 'approved', selfie: null, reviewed_at: new Date().toISOString() })
+  insert('modActions', { id: uuid(), kind: 'verify_approve', user_id: v.user_id, at: new Date().toISOString() })
+  if (u) notify(u.id, { type: 'verification', title: '✅ You are verified!', body: 'Your identity check passed. Your profile now shows the Verified badge.', data: {} })
+  res.json({ ok: true, status: 'approved' })
+})
+app.post('/v1/admin/verifications/:id/reject', requireAdmin, (req, res) => {
+  const v = find('verifications', (x) => x.id === req.params.id)
+  if (!v) return res.status(404).json({ error: 'Verification not found' })
+  const u = find('users', (x) => x.id === v.user_id)
+  if (u) update('users', u.id, { verification_status: 'rejected' })
+  update('verifications', v.id, { status: 'rejected', selfie: null, reviewed_at: new Date().toISOString(), note: (req.body && req.body.note) || '' })
+  insert('modActions', { id: uuid(), kind: 'verify_reject', user_id: v.user_id, at: new Date().toISOString() })
+  if (u) notify(u.id, { type: 'verification', title: 'Verification needs another try', body: 'Your selfie could not be verified. Please re-submit a clear, well-lit photo of your face.', data: {} })
+  res.json({ ok: true, status: 'rejected' })
 })
 
 // Remove (soft-delete) a flagged/abusive message
