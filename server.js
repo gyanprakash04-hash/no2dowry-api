@@ -30,12 +30,21 @@ const PUSH_LIVE = !!(webpush && VAPID_PUBLIC && VAPID_PRIVATE)
 if (PUSH_LIVE) { try { webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC, VAPID_PRIVATE) } catch (e) { console.error('VAPID setup failed:', e.message) } }
 
 /* ---------------- store (in-memory, optionally backed by Postgres) ---------------- */
-const DB = { users: [], profiles: [], otps: [], connections: [], conversations: [], messages: [], videoDates: [], reports: [], subscriptions: [], familyInvites: [], bestieInvites: [], blocks: [], modActions: [], notifications: [], pushSubs: [] }
+const DB = { users: [], profiles: [], otps: [], connections: [], conversations: [], messages: [], videoDates: [], reports: [], subscriptions: [], familyInvites: [], bestieInvites: [], blocks: [], modActions: [], notifications: [], pushSubs: [], events: [], errors: [] }
 const uuid = () => crypto.randomUUID()
 const find = (c, fn) => DB[c].find(fn)
 const filter = (c, fn) => DB[c].filter(fn)
 const insert = (c, row) => { DB[c].push(row); persist(c, row); return row }
 const update = (c, id, patch) => { const r = DB[c].find((x) => x.id === id); if (r) { Object.assign(r, patch); persist(c, r) } return r }
+// Insert into a high-volume collection but keep only the most recent `max` rows (memory + PG bounded).
+const logCapped = (c, row, max) => {
+  DB[c].push(row); persist(c, row)
+  while (DB[c].length > max) {
+    const old = DB[c].shift()
+    if (pgReady && old) pool.query('DELETE FROM kv WHERE collection=$1 AND id=$2', [c, String(old.id)]).catch(() => {})
+  }
+  return row
+}
 
 // Postgres persistence: load all rows on boot, write-through on every insert/update.
 // Uses a simple key-value table (collection,id,jsonb) so it mirrors the in-memory store exactly.
@@ -102,6 +111,14 @@ function requireAuth(req, res, next) {
   req.userId = claims.uid
   next()
 }
+// Soft auth: attach req.userId if a valid token is present, but never block the request.
+function optionalAuth(req, res, next) {
+  const h = req.headers.authorization || ''
+  const claims = verifyToken(h.startsWith('Bearer ') ? h.slice(7) : null)
+  if (claims && find('users', (x) => x.id === claims.uid && x.status !== 'banned')) req.userId = claims.uid
+  next()
+}
+
 // is there a block in either direction between a and b?
 const blockedBetween = (a, b) => DB.blocks.some((x) => (x.blocker === a && x.target === b) || (x.blocker === b && x.target === a))
 
@@ -244,7 +261,7 @@ app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); res.
 
 const inConvo = (c, uid) => c && (c.user_a === uid || c.user_b === uid)
 
-app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '1.6.0-notify', storage: pgReady ? 'postgres' : 'memory', otp: OTP_LIVE ? 'live' : 'demo', push: PUSH_LIVE ? 'on' : 'off', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
+app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '1.7.0-analytics', storage: pgReady ? 'postgres' : 'memory', otp: OTP_LIVE ? 'live' : 'demo', push: PUSH_LIVE ? 'on' : 'off', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
 
 // ---- OTP provider: MSG91 (WhatsApp primary + SMS fallback) with demo fallback ----
 // Set these env vars to go live: MSG91_AUTHKEY and MSG91_OTP_TEMPLATE_ID.
@@ -561,7 +578,77 @@ app.post('/v1/push/unsubscribe', requireAuth, (req, res) => {
   res.json({ ok: true, unsubscribed: true })
 })
 
-app.get('/v1/admin/stats', requireAdmin, (req, res) => res.json({ ok: true, users: DB.users.length, verified: filter('users', (u) => u.verification_status === 'verified').length, pledged: filter('users', (u) => u.pledge_taken_at).length, premium: filter('users', (u) => u.is_premium).length, connections: DB.connections.length, conversations: DB.conversations.length, videoDates: DB.videoDates.length, openReports: filter('reports', (r) => r.status === 'open').length }))
+/* ---- Analytics: first-party event + error ingest ---- */
+const SAFE_PROP = (v) => {
+  if (v == null) return v
+  if (typeof v === 'number' || typeof v === 'boolean') return v
+  return String(v).slice(0, 120) // cap strings; never store free-form PII blobs
+}
+app.post('/v1/events', optionalAuth, rateLimit(120, 60000), (req, res) => {
+  const body = req.body || {}
+  const list = Array.isArray(body.events) ? body.events : (body.name ? [body] : [])
+  if (!list.length) return res.json({ ok: true, accepted: 0 })
+  const ua = (req.headers['user-agent'] || '').slice(0, 200)
+  let n = 0
+  for (const e of list.slice(0, 50)) {
+    if (!e || !e.name) continue
+    const props = {}
+    if (e.props && typeof e.props === 'object') for (const k of Object.keys(e.props).slice(0, 12)) props[k] = SAFE_PROP(e.props[k])
+    logCapped('events', {
+      id: uuid(), name: String(e.name).slice(0, 60), props,
+      user_id: req.userId || null, anon_id: String(e.anon_id || '').slice(0, 40) || null,
+      ts: e.ts && !isNaN(new Date(e.ts)) ? new Date(e.ts).toISOString() : new Date().toISOString(), ua,
+    }, 8000)
+    n++
+  }
+  res.json({ ok: true, accepted: n })
+})
+app.post('/v1/errors', optionalAuth, rateLimit(60, 60000), (req, res) => {
+  const { message, stack, url, anon_id } = req.body || {}
+  if (!message) return res.status(400).json({ error: 'message required' })
+  logCapped('errors', {
+    id: uuid(), message: String(message).slice(0, 300), stack: String(stack || '').slice(0, 2000),
+    url: String(url || '').slice(0, 200), user_id: req.userId || null, anon_id: String(anon_id || '').slice(0, 40) || null,
+    ua: (req.headers['user-agent'] || '').slice(0, 200), created_at: new Date().toISOString(),
+  }, 2000)
+  res.json({ ok: true })
+})
+
+app.get('/v1/admin/analytics', requireAdmin, (req, res) => {
+  const days = Math.min(30, Math.max(1, Number(req.query.days) || 7))
+  const since = Date.now() - days * 864e5
+  const recent = filter('events', (e) => new Date(e.ts).getTime() >= since)
+  // event counts by name
+  const byName = {}
+  for (const e of recent) byName[e.name] = (byName[e.name] || 0) + 1
+  // daily active (unique user_id or anon_id per day)
+  const dau = {}
+  for (const e of recent) {
+    const day = e.ts.slice(0, 10)
+    const who = e.user_id || e.anon_id || 'anon'
+    ;(dau[day] = dau[day] || new Set()).add(who)
+  }
+  const dauSeries = Object.keys(dau).sort().map((d) => ({ day: d, active: dau[d].size }))
+  // onboarding funnel (unique actors who fired each step)
+  const FUNNEL = ['app_open', 'phone_entered', 'otp_verified', 'pledge_taken', 'identity_verified', 'profile_built', 'quiz_done', 'connect_sent']
+  const funnel = FUNNEL.map((step) => {
+    const actors = new Set()
+    for (const e of recent) if (e.name === step) actors.add(e.user_id || e.anon_id || 'anon')
+    return { step, count: actors.size }
+  })
+  // recent errors grouped by message
+  const errs = [...DB.errors].sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
+  const errGroups = {}
+  for (const e of errs) { const k = e.message; (errGroups[k] = errGroups[k] || { message: k, count: 0, last: e.created_at, sample: e }); errGroups[k].count++ }
+  res.json({
+    ok: true, days, totalEvents: recent.length, byName, dau: dauSeries, funnel,
+    errorCount: DB.errors.length,
+    errorGroups: Object.values(errGroups).sort((a, b) => b.count - a.count).slice(0, 30),
+    recentErrors: errs.slice(0, 20).map((e) => ({ message: e.message, url: e.url, created_at: e.created_at, stack: (e.stack || '').slice(0, 400) })),
+  })
+})
+
+app.get('/v1/admin/stats', requireAdmin, (req, res) => res.json({ ok: true, users: DB.users.length, verified: filter('users', (u) => u.verification_status === 'verified').length, pledged: filter('users', (u) => u.pledge_taken_at).length, premium: filter('users', (u) => u.is_premium).length, connections: DB.connections.length, conversations: DB.conversations.length, videoDates: DB.videoDates.length, openReports: filter('reports', (r) => r.status === 'open').length, events: DB.events.length, errors: DB.errors.length }))
 app.get('/v1/admin/flagged', requireAdmin, (req, res) => res.json({ ok: true, flaggedMessages: filter('messages', (m) => (m.shield_flags || []).length && !m.removed).map((m) => ({ id: m.id, sender: m.sender, body: m.body, flags: m.shield_flags, severity: m.shield_severity })), openReports: filter('reports', (r) => r.status === 'open') }))
 
 // helpers for moderation views
