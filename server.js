@@ -155,6 +155,40 @@ function scorePair(me, other) {
   return { compat, reasons: why }
 }
 
+/* ---------------- profile schema & completeness ---------------- */
+// Allowlisted profile fields we store, each with a weight toward the 0–100 completeness score.
+const PROFILE_FIELDS = {
+  // Core (≈25)
+  display_name: 4, gender: 3, dob: 2, age: 2, height_cm: 2, weight_kg: 1, marital_status: 3,
+  religion: 2, community: 1, mother_tongue: 2, nationality: 1, country: 1, state: 1, city: 2,
+  // Education (≈8)
+  qualification: 4, college: 2, education_field: 2,
+  // Career (≈10)
+  occupation: 4, company: 2, industry: 2, income_range: 2,
+  // Lifestyle (≈10)
+  diet: 3, smoking: 2, drinking: 2, fitness: 2, pets: 1,
+  // Family (≈7)
+  family_type: 3, family_values: 3, siblings: 1,
+  // Personality + about (≈12)
+  personality: 3, interests: 4, hobbies: 2, about_me: 3,
+  // Marriage preferences (≈10)
+  pref_age_min: 2, pref_age_max: 2, pref_religion: 2, pref_location: 2, pref_education: 1, pref_occupation: 1,
+  // Relationship expectations (≈8)
+  looking_for: 3, ready_to_marry_in: 3, relocation: 2,
+  // Anti-dowry commitment (≈5)
+  dowry_free_commitment: 5,
+  // Reflective questions (≈5)
+  q_marriage_meaning: 2, q_ideal_partner: 1, q_life_goals: 1, q_family_env: 1,
+}
+const PROFILE_KEYS = Object.keys(PROFILE_FIELDS).concat(['values_quiz', 'prompts'])
+const filled = (v) => v !== undefined && v !== null && v !== '' && !(Array.isArray(v) && v.length === 0)
+function computeCompleteness(p) {
+  if (!p) return 0
+  let got = 0, total = 0
+  for (const [k, w] of Object.entries(PROFILE_FIELDS)) { total += w; if (filled(p[k])) got += w }
+  return Math.round((got / total) * 100)
+}
+
 /* ---------------- app ---------------- */
 const app = express()
 app.set('trust proxy', 1) // Render is behind a proxy — needed for correct client IPs in rate limiting
@@ -172,7 +206,7 @@ app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); res.
 
 const inConvo = (c, uid) => c && (c.user_a === uid || c.user_b === uid)
 
-app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '1.3.0-secure', storage: pgReady ? 'postgres' : 'memory', otp: OTP_LIVE ? 'live' : 'demo', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
+app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '1.4.0-profiles', storage: pgReady ? 'postgres' : 'memory', otp: OTP_LIVE ? 'live' : 'demo', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
 
 // ---- OTP provider: MSG91 (WhatsApp primary + SMS fallback) with demo fallback ----
 // Set these env vars to go live: MSG91_AUTHKEY and MSG91_OTP_TEMPLATE_ID.
@@ -264,11 +298,17 @@ app.post('/v1/slow-mode', requireAuth, (req, res) => {
 
 app.get('/v1/profile', requireAuth, (req, res) => res.json({ ok: true, profile: find('profiles', (p) => p.user_id === req.userId) }))
 app.put('/v1/profile', requireAuth, (req, res) => {
-  const { display_name, age, city, occupation, interests, values_quiz, prompts } = req.body || {}
-  if (!display_name) return res.status(400).json({ error: 'display_name required' })
+  const body = req.body || {}
+  if (!body.display_name) return res.status(400).json({ error: 'display_name required' })
+  // accept only known profile keys (ignore anything else)
+  const data = {}
+  for (const k of PROFILE_KEYS) if (k in body) data[k] = body[k]
   let p = find('profiles', (x) => x.user_id === req.userId)
-  const data = { display_name, age, city, occupation, interests, values_quiz, prompts }
-  if (p) Object.assign(p, data); else p = insert('profiles', { id: uuid(), user_id: req.userId, ...data })
+  if (p) Object.assign(p, data)
+  else p = { id: uuid(), user_id: req.userId, ...data }
+  p.completeness = computeCompleteness(p)
+  if (find('profiles', (x) => x.user_id === req.userId)) update('profiles', p.id, p)
+  else insert('profiles', p)
   res.json({ ok: true, profile: p })
 })
 app.get('/v1/profile/:userId', requireAuth, (req, res) => {
@@ -284,7 +324,9 @@ app.get('/v1/matches/today', requireAuth, (req, res) => {
   const u = find('users', (x) => x.id === req.userId)
   const limit = u && u.slow_mode ? 2 : 4
   const others = filter('profiles', (p) => p.user_id !== req.userId)
-  const matches = others.map((o) => ({ o, ...scorePair(me, o) })).sort((a, b) => b.compat - a.compat).slice(0, limit).map((c) => {
+  // Visibility boost: profiles 80%+ complete are ranked higher (does not change the shown compat %).
+  const boost = (o) => (computeCompleteness(o) >= 80 ? 1000 : 0)
+  const matches = others.map((o) => ({ o, ...scorePair(me, o) })).sort((a, b) => (b.compat + boost(b.o)) - (a.compat + boost(a.o))).slice(0, limit).map((c) => {
     const ou = find('users', (x) => x.id === c.o.user_id) || {}
     return { user_id: c.o.user_id, name: c.o.display_name, age: c.o.age, city: c.o.city, occupation: c.o.occupation, interests: c.o.interests, compatibility_score: c.compat, reasons: c.reasons, trust_score: ou.trust_score }
   })
