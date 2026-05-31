@@ -224,8 +224,8 @@ const PROFILE_FIELDS = {
   diet: 3, smoking: 2, drinking: 2, fitness: 2, pets: 1,
   // Family (≈7)
   family_type: 3, family_values: 3, siblings: 1,
-  // Personality + about (≈12)
-  personality: 3, interests: 4, hobbies: 2, about_me: 3,
+  // Photos + Personality + about
+  photos: 6, personality: 3, interests: 4, hobbies: 2, about_me: 3,
   // Marriage preferences (≈10)
   pref_age_min: 2, pref_age_max: 2, pref_religion: 2, pref_location: 2, pref_education: 1, pref_occupation: 1,
   // Relationship expectations (≈8)
@@ -261,7 +261,7 @@ app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); res.
 
 const inConvo = (c, uid) => c && (c.user_a === uid || c.user_b === uid)
 
-app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '1.9.0-verify', storage: pgReady ? 'postgres' : 'memory', otp: OTP_LIVE ? 'live' : 'demo', push: PUSH_LIVE ? 'on' : 'off', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
+app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '2.0.0-photos', storage: pgReady ? 'postgres' : 'memory', otp: OTP_LIVE ? 'live' : 'demo', push: PUSH_LIVE ? 'on' : 'off', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
 
 // ---- OTP provider: MSG91 (WhatsApp primary + SMS fallback) with demo fallback ----
 // Set these env vars to go live: MSG91_AUTHKEY and MSG91_OTP_TEMPLATE_ID.
@@ -386,6 +386,21 @@ app.put('/v1/profile', requireAuth, (req, res) => {
   else insert('profiles', p)
   res.json({ ok: true, profile: p })
 })
+// Profile photos: ordered list, photos[0] = primary. Up to 7. URLs must be from our Cloudinary.
+app.put('/v1/profile/photos', requireAuth, (req, res) => {
+  const { photos } = req.body || {}
+  if (!Array.isArray(photos)) return res.status(400).json({ error: 'photos array required' })
+  const clean = photos
+    .filter((ph) => ph && typeof ph.url === 'string' && /^https:\/\/res\.cloudinary\.com\//.test(ph.url))
+    .slice(0, 7)
+    .map((ph) => ({ url: ph.url, public_id: typeof ph.public_id === 'string' ? ph.public_id.slice(0, 200) : null }))
+  let p = find('profiles', (x) => x.user_id === req.userId)
+  if (!p) return res.status(400).json({ error: 'Build your profile first.' })
+  p.photos = clean
+  p.completeness = computeCompleteness(p)
+  update('profiles', p.id, p)
+  res.json({ ok: true, photos: clean, completeness: p.completeness })
+})
 app.get('/v1/profile/:userId', requireAuth, (req, res) => {
   const prof = find('profiles', (p) => p.user_id === req.params.userId)
   if (!prof) return res.status(404).json({ error: 'Profile not found' })
@@ -400,7 +415,7 @@ app.get('/v1/profile/:userId', requireAuth, (req, res) => {
       notify(owner, { type: 'profile_view', title: '👀 Someone viewed your profile', body: 'A member just checked out your profile.', data: {} })
     }
   }
-  res.json({ ok: true, profile: { user_id: prof.user_id, display_name: prof.display_name, age: prof.age, city: prof.city, occupation: prof.occupation, interests: prof.interests || [], prompts: prof.prompts || [], kundli: prof.kundli || null, trust_score: u.trust_score, verified: u.verification_status === 'verified', phone_verified: !!u.phone_verified, pledged: !!u.pledge_taken_at } })
+  res.json({ ok: true, profile: { user_id: prof.user_id, display_name: prof.display_name, age: prof.age, city: prof.city, occupation: prof.occupation, interests: prof.interests || [], prompts: prof.prompts || [], kundli: prof.kundli || null, trust_score: u.trust_score, verified: u.verification_status === 'verified', phone_verified: !!u.phone_verified, pledged: !!u.pledge_taken_at, photos: prof.photos || [] } })
 })
 
 app.get('/v1/matches/today', requireAuth, (req, res) => {
@@ -413,7 +428,7 @@ app.get('/v1/matches/today', requireAuth, (req, res) => {
   const boost = (o) => (computeCompleteness(o) >= 80 ? 1000 : 0)
   const matches = others.map((o) => ({ o, ...scorePair(me, o) })).sort((a, b) => (b.compat + boost(b.o)) - (a.compat + boost(a.o))).slice(0, limit).map((c) => {
     const ou = find('users', (x) => x.id === c.o.user_id) || {}
-    return { user_id: c.o.user_id, name: c.o.display_name, age: c.o.age, city: c.o.city, occupation: c.o.occupation, interests: c.o.interests, compatibility_score: c.compat, reasons: c.reasons, trust_score: ou.trust_score }
+    return { user_id: c.o.user_id, name: c.o.display_name, age: c.o.age, city: c.o.city, occupation: c.o.occupation, interests: c.o.interests, compatibility_score: c.compat, reasons: c.reasons, trust_score: ou.trust_score, photo: (c.o.photos && c.o.photos[0]) ? c.o.photos[0].url : null }
   })
   res.json({ ok: true, date: new Date().toISOString().slice(0, 10), matches })
 })
