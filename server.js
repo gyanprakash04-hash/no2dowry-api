@@ -71,6 +71,7 @@ function requireAuth(req, res, next) {
   const h = req.headers.authorization || ''
   const claims = verifyToken(h.startsWith('Bearer ') ? h.slice(7) : null)
   if (!claims) return res.status(401).json({ error: 'Unauthorized — please log in.' })
+  if (!find('users', (u) => u.id === claims.uid)) return res.status(401).json({ error: 'Account not found — please log in again.' })
   req.userId = claims.uid
   next()
 }
@@ -118,19 +119,55 @@ app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); res.
 
 const inConvo = (c, uid) => c && (c.user_a === uid || c.user_b === uid)
 
-app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '1.1.0', storage: pgReady ? 'postgres' : 'memory', time: new Date().toISOString() }))
+app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '1.2.0', storage: pgReady ? 'postgres' : 'memory', otp: OTP_LIVE ? 'msg91' : 'demo', time: new Date().toISOString() }))
 
-app.post('/v1/auth/otp', (req, res) => {
+// ---- OTP provider: MSG91 (WhatsApp primary + SMS fallback) with demo fallback ----
+// Set these env vars to go live: MSG91_AUTHKEY and MSG91_OTP_TEMPLATE_ID.
+// Channel order (WhatsApp then SMS) is configured on the MSG91 OTP template/settings.
+// Until the keys are set, OTP runs in DEMO mode (fixed code 7291) so the app keeps working.
+const MSG91_AUTHKEY = process.env.MSG91_AUTHKEY || ''
+const MSG91_OTP_TEMPLATE_ID = process.env.MSG91_OTP_TEMPLATE_ID || ''
+const OTP_LIVE = !!(MSG91_AUTHKEY && MSG91_OTP_TEMPLATE_ID)
+const toMobile = (p) => { const d = String(p).replace(/\D/g, ''); return d.length === 10 ? '91' + d : d }
+
+async function otpSend(phone) {
+  if (!OTP_LIVE) {
+    const ex = find('otps', (o) => o.phone === phone)
+    if (ex) ex.code = '7291'; else insert('otps', { id: uuid(), phone, code: '7291' })
+    return { sent: true, devCode: '7291', channel: 'demo' }
+  }
+  const url = 'https://control.msg91.com/api/v5/otp?template_id=' + encodeURIComponent(MSG91_OTP_TEMPLATE_ID) +
+    '&mobile=' + toMobile(phone) + '&otp_expiry=10&realTimeResponse=1'
+  const r = await fetch(url, { method: 'POST', headers: { authkey: MSG91_AUTHKEY, 'Content-Type': 'application/json' }, body: '{}' })
+  const data = await r.json().catch(() => ({}))
+  if (data.type === 'success' || r.ok) return { sent: true, channel: 'whatsapp+sms' }
+  throw new Error(data.message || 'OTP send failed')
+}
+async function otpVerify(phone, code) {
+  if (!OTP_LIVE) {
+    const rec = find('otps', (o) => o.phone === phone)
+    return !!(rec && rec.code === String(code))
+  }
+  const url = 'https://control.msg91.com/api/v5/otp/verify?otp=' + encodeURIComponent(code) + '&mobile=' + toMobile(phone)
+  const r = await fetch(url, { headers: { authkey: MSG91_AUTHKEY } })
+  const data = await r.json().catch(() => ({}))
+  return data.type === 'success'
+}
+
+app.post('/v1/auth/otp', async (req, res) => {
   const { phone } = req.body || {}
   if (!phone) return res.status(400).json({ error: 'phone required' })
-  const ex = find('otps', (o) => o.phone === phone)
-  if (ex) ex.code = '7291'; else insert('otps', { id: uuid(), phone, code: '7291' })
-  res.json({ ok: true, sent: true, devCode: '7291' })
+  try {
+    const r = await otpSend(phone)
+    res.json({ ok: true, ...r })
+  } catch (e) { res.status(502).json({ error: 'Could not send code: ' + e.message }) }
 })
-app.post('/v1/auth/verify', (req, res) => {
+app.post('/v1/auth/verify', async (req, res) => {
   const { phone, code } = req.body || {}
-  const rec = find('otps', (o) => o.phone === phone)
-  if (!rec || rec.code !== code) return res.status(401).json({ error: 'Invalid code' })
+  if (!phone || !code) return res.status(400).json({ error: 'phone and code required' })
+  let ok = false
+  try { ok = await otpVerify(phone, code) } catch (e) { return res.status(502).json({ error: 'Verify failed: ' + e.message }) }
+  if (!ok) return res.status(401).json({ error: 'Invalid code' })
   let user = find('users', (u) => u.phone === phone)
   if (!user) user = insert('users', { id: uuid(), phone, created_at: new Date().toISOString(), pledge_taken_at: null, verification_status: 'pending', trust_score: 42, is_premium: false, status: 'active', slow_mode: false })
   res.json({ ok: true, token: issueToken(user.id), user })
@@ -147,6 +184,24 @@ app.post('/v1/verification/start', requireAuth, (req, res) => {
   const u = find('users', (x) => x.id === req.userId)
   update('users', u.id, { verification_status: 'verified', trust_score: Math.min(100, u.trust_score + 20) })
   res.json({ ok: true, user: u })
+})
+// DPDP right-to-erasure: delete the member's account and their data (memory + Postgres).
+app.post('/v1/account/delete', requireAuth, (req, res) => {
+  const uid = req.userId
+  const convoIds = filter('conversations', (c) => c.user_a === uid || c.user_b === uid).map((c) => c.id)
+  const isMine = (row) => row.user_id === uid || row.id === uid || row.from_user === uid || row.to_user === uid ||
+    row.requester === uid || row.recipient === uid || row.sender === uid || row.reporter === uid ||
+    row.user_a === uid || row.user_b === uid || (row.conversation_id && convoIds.includes(row.conversation_id))
+  for (const coll of Object.keys(DB)) {
+    const removed = DB[coll].filter(isMine)
+    DB[coll] = DB[coll].filter((r) => !isMine(r))
+    if (pgReady) {
+      for (const r of removed) {
+        pool.query('DELETE FROM kv WHERE collection=$1 AND id=$2', [coll, String(r.id)]).catch((e) => console.error('delete error:', e.message))
+      }
+    }
+  }
+  res.json({ ok: true, deleted: true })
 })
 app.post('/v1/slow-mode', requireAuth, (req, res) => {
   const u = find('users', (x) => x.id === req.userId)
@@ -198,7 +253,20 @@ app.post('/v1/connections', requireAuth, (req, res) => {
   }
   res.json({ ok: true, connection: row, conversation, autoAccepted: !!conversation })
 })
-app.get('/v1/connections', requireAuth, (req, res) => res.json({ ok: true, connections: filter('connections', (c) => c.from_user === req.userId || c.to_user === req.userId) }))
+app.get('/v1/connections', requireAuth, (req, res) => {
+  const mine = filter('connections', (c) => c.from_user === req.userId || c.to_user === req.userId).map((c) => {
+    const incoming = c.to_user === req.userId
+    const otherId = incoming ? c.from_user : c.to_user
+    const prof = find('profiles', (p) => p.user_id === otherId)
+    const u = find('users', (x) => x.id === otherId) || {}
+    return {
+      id: c.id, status: c.status, direction: incoming ? 'incoming' : 'outgoing',
+      opener_message: c.opener_message, created_at: c.created_at,
+      other: { user_id: otherId, name: prof ? prof.display_name : 'Member', city: prof ? prof.city : '', age: prof ? prof.age : null, trust_score: u.trust_score },
+    }
+  })
+  res.json({ ok: true, connections: mine })
+})
 app.post('/v1/connections/:id/accept', requireAuth, (req, res) => {
   const c = find('connections', (x) => x.id === req.params.id)
   if (!c) return res.status(404).json({ error: 'Not found' })
