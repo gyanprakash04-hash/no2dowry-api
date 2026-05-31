@@ -261,7 +261,7 @@ app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); res.
 
 const inConvo = (c, uid) => c && (c.user_a === uid || c.user_b === uid)
 
-app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '1.7.0-analytics', storage: pgReady ? 'postgres' : 'memory', otp: OTP_LIVE ? 'live' : 'demo', push: PUSH_LIVE ? 'on' : 'off', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
+app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '1.8.0-admin', storage: pgReady ? 'postgres' : 'memory', otp: OTP_LIVE ? 'live' : 'demo', push: PUSH_LIVE ? 'on' : 'off', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
 
 // ---- OTP provider: MSG91 (WhatsApp primary + SMS fallback) with demo fallback ----
 // Set these env vars to go live: MSG91_AUTHKEY and MSG91_OTP_TEMPLATE_ID.
@@ -328,11 +328,13 @@ app.post('/v1/verification/start', requireAuth, (req, res) => {
   res.json({ ok: true, user: u })
 })
 // DPDP right-to-erasure: delete the member's account and their data (memory + Postgres).
-app.post('/v1/account/delete', requireAuth, (req, res) => {
-  const uid = req.userId
+// Permanently remove a user and everything tied to them (profiles, connections,
+// conversations+messages, blocks, reports, notifications, push subs, etc.).
+function purgeUser(uid) {
   const convoIds = filter('conversations', (c) => c.user_a === uid || c.user_b === uid).map((c) => c.id)
   const isMine = (row) => row.user_id === uid || row.id === uid || row.from_user === uid || row.to_user === uid ||
     row.requester === uid || row.recipient === uid || row.sender === uid || row.reporter === uid ||
+    row.blocker === uid || row.target === uid || row.target_user === uid ||
     row.user_a === uid || row.user_b === uid || (row.conversation_id && convoIds.includes(row.conversation_id))
   for (const coll of Object.keys(DB)) {
     const removed = DB[coll].filter(isMine)
@@ -343,6 +345,9 @@ app.post('/v1/account/delete', requireAuth, (req, res) => {
       }
     }
   }
+}
+app.post('/v1/account/delete', requireAuth, (req, res) => {
+  purgeUser(req.userId)
   res.json({ ok: true, deleted: true })
 })
 app.post('/v1/slow-mode', requireAuth, (req, res) => {
@@ -703,6 +708,14 @@ app.post('/v1/admin/users/:id/unban', requireAdmin, (req, res) => {
   update('users', u.id, { status: 'active', banned_at: null })
   insert('modActions', { id: uuid(), kind: 'unban', user_id: u.id, at: new Date().toISOString() })
   res.json({ ok: true, user: { id: u.id, status: 'active' } })
+})
+// Admin hard-delete: permanently remove a user and all their data.
+app.post('/v1/admin/users/:id/delete', requireAdmin, (req, res) => {
+  const u = find('users', (x) => x.id === req.params.id)
+  if (!u) return res.status(404).json({ error: 'User not found' })
+  purgeUser(u.id)
+  insert('modActions', { id: uuid(), kind: 'delete_user', user_id: req.params.id, at: new Date().toISOString() })
+  res.json({ ok: true, deleted: true })
 })
 
 // Remove (soft-delete) a flagged/abusive message
