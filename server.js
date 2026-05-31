@@ -19,8 +19,18 @@ const ADMIN_TOKEN = process.env.ADMIN_TOKEN || ''
 // Auth tokens expire after this many days; user re-authenticates via OTP afterwards.
 const TOKEN_MAX_AGE_MS = (Number(process.env.TOKEN_MAX_AGE_DAYS) || 30) * 864e5
 
+// --- Web Push (VAPID). Optional: if keys/lib are absent, OS push is disabled but
+// in-app notifications still work. Generate keys once with `npx web-push generate-vapid-keys`. ---
+let webpush = null
+try { webpush = (await import('web-push')).default } catch { console.warn('web-push not installed — OS push disabled (in-app notifications still work).') }
+const VAPID_PUBLIC = process.env.VAPID_PUBLIC || ''
+const VAPID_PRIVATE = process.env.VAPID_PRIVATE || ''
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:no2dowry.ad2click@gmail.com'
+const PUSH_LIVE = !!(webpush && VAPID_PUBLIC && VAPID_PRIVATE)
+if (PUSH_LIVE) { try { webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC, VAPID_PRIVATE) } catch (e) { console.error('VAPID setup failed:', e.message) } }
+
 /* ---------------- store (in-memory, optionally backed by Postgres) ---------------- */
-const DB = { users: [], profiles: [], otps: [], connections: [], conversations: [], messages: [], videoDates: [], reports: [], subscriptions: [], familyInvites: [], bestieInvites: [], blocks: [], modActions: [] }
+const DB = { users: [], profiles: [], otps: [], connections: [], conversations: [], messages: [], videoDates: [], reports: [], subscriptions: [], familyInvites: [], bestieInvites: [], blocks: [], modActions: [], notifications: [], pushSubs: [] }
 const uuid = () => crypto.randomUUID()
 const find = (c, fn) => DB[c].find(fn)
 const filter = (c, fn) => DB[c].filter(fn)
@@ -94,6 +104,30 @@ function requireAuth(req, res, next) {
 }
 // is there a block in either direction between a and b?
 const blockedBetween = (a, b) => DB.blocks.some((x) => (x.blocker === a && x.target === b) || (x.blocker === b && x.target === a))
+
+// Record an in-app notification and (if push is live) deliver an OS push to all the user's devices.
+function notify(userId, n) {
+  if (!userId) return null
+  const row = insert('notifications', {
+    id: uuid(), user_id: userId, type: n.type || 'general',
+    title: n.title || '', body: n.body || '', data: n.data || {},
+    read: false, created_at: new Date().toISOString(),
+  })
+  if (PUSH_LIVE) {
+    const payload = JSON.stringify({ title: row.title, body: row.body, type: row.type, data: row.data })
+    for (const s of filter('pushSubs', (x) => x.user_id === userId)) {
+      webpush.sendNotification(s.subscription, payload).catch((err) => {
+        if (err && (err.statusCode === 404 || err.statusCode === 410)) {
+          DB.pushSubs = DB.pushSubs.filter((x) => x.id !== s.id)
+          if (pgReady) pool.query('DELETE FROM kv WHERE collection=$1 AND id=$2', ['pushSubs', String(s.id)]).catch(() => {})
+        }
+      })
+    }
+  }
+  return row
+}
+// throttle "profile viewed" pings: at most one per viewer→owner per hour
+const lastView = new Map()
 // Admin gate: requires the ADMIN_TOKEN in the x-admin-token header. Locked entirely if ADMIN_TOKEN unset.
 function requireAdmin(req, res, next) {
   if (!ADMIN_TOKEN) return res.status(403).json({ error: 'Admin access is disabled (ADMIN_TOKEN not configured).' })
@@ -210,7 +244,7 @@ app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); res.
 
 const inConvo = (c, uid) => c && (c.user_a === uid || c.user_b === uid)
 
-app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '1.5.0-safety', storage: pgReady ? 'postgres' : 'memory', otp: OTP_LIVE ? 'live' : 'demo', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
+app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '1.6.0-notify', storage: pgReady ? 'postgres' : 'memory', otp: OTP_LIVE ? 'live' : 'demo', push: PUSH_LIVE ? 'on' : 'off', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
 
 // ---- OTP provider: MSG91 (WhatsApp primary + SMS fallback) with demo fallback ----
 // Set these env vars to go live: MSG91_AUTHKEY and MSG91_OTP_TEMPLATE_ID.
@@ -319,6 +353,16 @@ app.get('/v1/profile/:userId', requireAuth, (req, res) => {
   const prof = find('profiles', (p) => p.user_id === req.params.userId)
   if (!prof) return res.status(404).json({ error: 'Profile not found' })
   const u = find('users', (x) => x.id === req.params.userId) || {}
+  // "Someone viewed your profile" — only for real members, not self, not blocked, throttled to 1/hour per viewer→owner
+  const owner = req.params.userId
+  if (owner !== req.userId && !u.is_sample && !blockedBetween(req.userId, owner)) {
+    const key = req.userId + '|' + owner
+    const now = Date.now()
+    if (!lastView.has(key) || now - lastView.get(key) > 3600000) {
+      lastView.set(key, now)
+      notify(owner, { type: 'profile_view', title: '👀 Someone viewed your profile', body: 'A member just checked out your profile.', data: {} })
+    }
+  }
   res.json({ ok: true, profile: { user_id: prof.user_id, display_name: prof.display_name, age: prof.age, city: prof.city, occupation: prof.occupation, interests: prof.interests || [], prompts: prof.prompts || [], kundli: prof.kundli || null, trust_score: u.trust_score, verified: u.verification_status === 'verified', pledged: !!u.pledge_taken_at } })
 })
 
@@ -350,6 +394,10 @@ app.post('/v1/connections', requireAuth, rateLimit(30, 60000), (req, res) => {
     const pair = [req.userId, to_user].sort()
     conversation = insert('conversations', { id: uuid(), user_a: pair[0], user_b: pair[1], created_at: new Date().toISOString() })
     insert('messages', { id: uuid(), conversation_id: conversation.id, sender: to_user, body: 'Hi! So glad you reached out 😊 What made you say yes to the pledge?', shield_flags: [], shield_severity: 'none', created_at: new Date().toISOString() })
+  } else {
+    // notify the recipient of a new connection request
+    const me = find('profiles', (p) => p.user_id === req.userId)
+    notify(to_user, { type: 'connection_request', title: '💛 New connection request', body: (me ? me.display_name : 'Someone') + ' wants to connect with you.', data: { connection_id: row.id } })
   }
   res.json({ ok: true, connection: row, conversation, autoAccepted: !!conversation })
 })
@@ -375,6 +423,8 @@ app.post('/v1/connections/:id/accept', requireAuth, (req, res) => {
   const pair = [c.from_user, c.to_user].sort()
   let convo = find('conversations', (x) => [x.user_a, x.user_b].sort().join() === pair.join())
   if (!convo) convo = insert('conversations', { id: uuid(), user_a: pair[0], user_b: pair[1], created_at: new Date().toISOString() })
+  const me = find('profiles', (p) => p.user_id === req.userId)
+  notify(c.from_user, { type: 'connection_accepted', title: '🎉 Connection accepted', body: (me ? me.display_name : 'Your match') + ' accepted your request — say hello!', data: { conversation_id: convo.id } })
   res.json({ ok: true, connection: c, conversation: convo })
 })
 
@@ -406,6 +456,10 @@ app.post('/v1/conversations/:id/messages', requireAuth, rateLimit(30, 60000), (r
   if (other && other.is_sample && shield.severity !== 'high') {
     const replies = ['Haha I love that.', 'Totally agree 😄', 'Tell me more!', 'That is so me too.', 'Okay that won me over ☕']
     insert('messages', { id: uuid(), conversation_id: convo.id, sender: otherId, body: replies[Math.floor(Math.random() * replies.length)], shield_flags: [], shield_severity: 'none', created_at: new Date().toISOString() })
+  } else if (other && !other.is_sample && shield.severity !== 'high') {
+    // notify the real recipient of a new message
+    const me = find('profiles', (p) => p.user_id === req.userId)
+    notify(otherId, { type: 'message', title: '💬 ' + (me ? me.display_name : 'New message'), body: body.length > 80 ? body.slice(0, 77) + '…' : body, data: { conversation_id: convo.id } })
   }
   res.json({ ok: true, message: msg, shield, warning: shield.severity === 'high' ? 'This message was flagged by our safety shield and sent for review.' : null })
 })
@@ -475,6 +529,38 @@ app.post('/v1/unblock', requireAuth, (req, res) => {
   res.json({ ok: true, unblocked: true })
 })
 
+/* ---- Notifications (in-app) ---- */
+app.get('/v1/notifications', requireAuth, (req, res) => {
+  const mine = filter('notifications', (n) => n.user_id === req.userId)
+    .sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
+    .slice(0, 50)
+  res.json({ ok: true, notifications: mine, unread: mine.filter((n) => !n.read).length })
+})
+app.post('/v1/notifications/read', requireAuth, (req, res) => {
+  const { ids } = req.body || {}
+  const mine = filter('notifications', (n) => n.user_id === req.userId)
+  const target = Array.isArray(ids) && ids.length ? mine.filter((n) => ids.includes(n.id)) : mine
+  for (const n of target) if (!n.read) update('notifications', n.id, { read: true })
+  res.json({ ok: true, unread: filter('notifications', (n) => n.user_id === req.userId && !n.read).length })
+})
+
+/* ---- Web Push subscriptions ---- */
+app.get('/v1/push/vapid', (req, res) => res.json({ ok: true, enabled: PUSH_LIVE, publicKey: PUSH_LIVE ? VAPID_PUBLIC : null }))
+app.post('/v1/push/subscribe', requireAuth, (req, res) => {
+  const { subscription } = req.body || {}
+  if (!subscription || !subscription.endpoint) return res.status(400).json({ error: 'subscription required' })
+  const existing = find('pushSubs', (s) => s.user_id === req.userId && s.subscription && s.subscription.endpoint === subscription.endpoint)
+  if (!existing) insert('pushSubs', { id: uuid(), user_id: req.userId, subscription, created_at: new Date().toISOString() })
+  res.json({ ok: true, subscribed: true, pushEnabled: PUSH_LIVE })
+})
+app.post('/v1/push/unsubscribe', requireAuth, (req, res) => {
+  const { endpoint } = req.body || {}
+  const gone = filter('pushSubs', (s) => s.user_id === req.userId && (!endpoint || (s.subscription && s.subscription.endpoint === endpoint)))
+  DB.pushSubs = DB.pushSubs.filter((s) => !gone.includes(s))
+  if (pgReady) for (const s of gone) pool.query('DELETE FROM kv WHERE collection=$1 AND id=$2', ['pushSubs', String(s.id)]).catch(() => {})
+  res.json({ ok: true, unsubscribed: true })
+})
+
 app.get('/v1/admin/stats', requireAdmin, (req, res) => res.json({ ok: true, users: DB.users.length, verified: filter('users', (u) => u.verification_status === 'verified').length, pledged: filter('users', (u) => u.pledge_taken_at).length, premium: filter('users', (u) => u.is_premium).length, connections: DB.connections.length, conversations: DB.conversations.length, videoDates: DB.videoDates.length, openReports: filter('reports', (r) => r.status === 'open').length }))
 app.get('/v1/admin/flagged', requireAdmin, (req, res) => res.json({ ok: true, flaggedMessages: filter('messages', (m) => (m.shield_flags || []).length && !m.removed).map((m) => ({ id: m.id, sender: m.sender, body: m.body, flags: m.shield_flags, severity: m.shield_severity })), openReports: filter('reports', (r) => r.status === 'open') }))
 
@@ -512,6 +598,7 @@ app.post('/v1/admin/reports/:id/resolve', requireAdmin, (req, res) => {
   const { action } = req.body || {}
   update('reports', r.id, { status: 'resolved', resolved_at: new Date().toISOString(), resolution: action || 'reviewed' })
   insert('modActions', { id: uuid(), kind: 'resolve_report', report_id: r.id, action: action || 'reviewed', at: new Date().toISOString() })
+  notify(r.reporter, { type: 'report_reviewed', title: '🛡️ Your report was reviewed', body: 'Thank you for keeping No2Dowry safe. Our team has reviewed your report and taken appropriate action.', data: { report_id: r.id } })
   res.json({ ok: true, report: find('reports', (x) => x.id === r.id) })
 })
 
