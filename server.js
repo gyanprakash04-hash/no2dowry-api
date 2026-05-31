@@ -242,6 +242,8 @@ const PROFILE_FIELDS = {
   looking_for: 3, ready_to_marry_in: 3, relocation: 2,
   // Anti-dowry commitment (≈5)
   dowry_free_commitment: 5,
+  // Social verification connections (boost trust/completeness)
+  google_connected: 3, linkedin_connected: 3, facebook_connected: 2,
   // Reflective questions (≈5)
   q_marriage_meaning: 2, q_ideal_partner: 1, q_life_goals: 1, q_family_env: 1,
 }
@@ -271,7 +273,7 @@ app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); res.
 
 const inConvo = (c, uid) => c && (c.user_a === uid || c.user_b === uid)
 
-app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '2.3.0-matrimony', storage: pgReady ? 'postgres' : 'memory', otp: SMS_LIVE ? 'sms' : (OTP_LIVE ? 'whatsapp' : 'demo'), push: PUSH_LIVE ? 'on' : 'off', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
+app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '2.4.0-auth', storage: pgReady ? 'postgres' : 'memory', auth_mode: AUTH_MODE, otp: SMS_LIVE ? 'sms' : (OTP_LIVE ? 'whatsapp' : 'demo'), social: { google: !!GOOGLE_CLIENT_ID, linkedin: !!LINKEDIN_CLIENT_ID, facebook: !!FACEBOOK_APP_ID }, push: PUSH_LIVE ? 'on' : 'off', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
 
 // ---- OTP provider: MSG91 (WhatsApp primary + SMS fallback) with demo fallback ----
 // Set these env vars to go live: MSG91_AUTHKEY and MSG91_OTP_TEMPLATE_ID.
@@ -287,6 +289,14 @@ const SMS_TEMPLATE_ID = process.env.SMS_TEMPLATE_ID || ''
 const SMS_API_URL = process.env.SMS_API_URL || 'http://mysms.streaminbox.in/vb/apikey.php'
 const SMS_TEMPLATE = process.env.SMS_TEMPLATE || 'Your No2Dowry verification code is {OTP}. Valid for 10 minutes. Do not share it with anyone.'
 const SMS_LIVE = !!(SMS_APIKEY && SMS_SENDERID)
+// AUTH_MODE controls phone verification: 'otp_disabled' (phone required, no code — beta unblocker),
+// 'otp_demo' (fixed code 7291), 'otp_production' (real SMS via gateway). Switch by env only.
+const AUTH_MODE = (process.env.AUTH_MODE || 'otp_disabled').toLowerCase()
+// Social login: set each provider's client id to enable it (Google works with just the public client id;
+// LinkedIn/Facebook also need their server OAuth set up). Each activates by config only.
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || ''
+const LINKEDIN_CLIENT_ID = process.env.LINKEDIN_CLIENT_ID || ''
+const FACEBOOK_APP_ID = process.env.FACEBOOK_APP_ID || ''
 // legacy MSG91 fallback (kept for compatibility)
 const MSG91_AUTHKEY = process.env.MSG91_AUTHKEY || ''
 const MSG91_OTP_TEMPLATE_ID = process.env.MSG91_OTP_TEMPLATE_ID || ''
@@ -297,6 +307,11 @@ const toMobile = (p) => { const d = String(p).replace(/\D/g, ''); return d.lengt
 const setOtp = (phone, code) => { const ex = find('otps', (o) => o.phone === phone); if (ex) { ex.code = code; ex.t = Date.now(); persist('otps', ex) } else insert('otps', { id: uuid(), phone, code, t: Date.now() }) }
 
 async function otpSend(phone) {
+  // otp_disabled: phone is still required, but no code is sent or checked (beta unblocker).
+  if (AUTH_MODE === 'otp_disabled') return { sent: true, channel: 'disabled', mode: 'otp_disabled' }
+  // otp_demo: fixed code, no real SMS.
+  if (AUTH_MODE === 'otp_demo') { setOtp(phone, '7291'); return { sent: true, devCode: '7291', channel: 'demo' } }
+  // otp_production: real SMS via gateway (or MSG91 fallback).
   if (SMS_LIVE) {
     const code = genCode()
     setOtp(phone, code)
@@ -317,11 +332,13 @@ async function otpSend(phone) {
     if (data.type === 'success' || r.ok) return { sent: true, channel: 'whatsapp+sms' }
     throw new Error(data.message || 'OTP send failed')
   }
-  // DEMO: fixed code, no real SMS
-  setOtp(phone, '7291')
-  return { sent: true, devCode: '7291', channel: 'demo' }
+  // otp_production but no SMS provider configured
+  throw new Error('OTP provider not configured. Set SMS_* env or switch AUTH_MODE.')
 }
 async function otpVerify(phone, code) {
+  // otp_disabled: accept without a code (phone-only registration).
+  if (AUTH_MODE === 'otp_disabled') return true
+  if (AUTH_MODE === 'otp_demo') { const rec = find('otps', (o) => o.phone === phone); return !!(rec && rec.code === String(code).trim()) }
   if (SMS_LIVE) {
     const rec = find('otps', (o) => o.phone === phone)
     if (!rec || !rec.code) return false
@@ -348,16 +365,78 @@ app.post('/v1/auth/otp', rateLimit(5, 60000), rateLimit(20, 864e5), async (req, 
 })
 app.post('/v1/auth/verify', rateLimit(10, 60000), async (req, res) => {
   const { phone, code } = req.body || {}
-  if (!phone || !code) return res.status(400).json({ error: 'phone and code required' })
+  if (!phone) return res.status(400).json({ error: 'phone required' })
+  if (AUTH_MODE !== 'otp_disabled' && !code) return res.status(400).json({ error: 'code required' })
   let ok = false
   try { ok = await otpVerify(phone, code) } catch (e) { return res.status(502).json({ error: 'Verify failed: ' + e.message }) }
   if (!ok) return res.status(401).json({ error: 'Invalid code' })
+  // In otp_disabled the phone is captured but NOT verified; in demo/production a passed code = verified.
+  const verified = AUTH_MODE !== 'otp_disabled'
   // Match by normalized digits so "+91 98…", "98…", "9198…" all map to ONE account (no duplicates).
   const norm = toMobile(phone)
   let user = find('users', (u) => toMobile(u.phone) === norm)
-  if (!user) user = insert('users', { id: uuid(), phone, created_at: new Date().toISOString(), pledge_taken_at: null, verification_status: 'unverified', phone_verified: true, phone_verified_at: new Date().toISOString(), trust_score: 42, is_premium: false, status: 'active', slow_mode: false })
-  else if (!user.phone_verified) update('users', user.id, { phone_verified: true, phone_verified_at: new Date().toISOString() })
+  if (!user) user = insert('users', { id: uuid(), phone, created_at: new Date().toISOString(), pledge_taken_at: null, verification_status: 'unverified', phone_verified: verified, phone_verified_at: verified ? new Date().toISOString() : null, google_connected: false, linkedin_connected: false, facebook_connected: false, social_ids: {}, trust_score: 42, is_premium: false, status: 'active', slow_mode: false })
+  else if (verified && !user.phone_verified) update('users', user.id, { phone_verified: true, phone_verified_at: new Date().toISOString() })
   res.json({ ok: true, token: issueToken(user.id), user: find('users', (u) => u.id === user.id) })
+})
+
+// What auth methods the client should offer (drives the login UI). Public.
+app.get('/v1/auth/config', (req, res) => res.json({
+  ok: true, auth_mode: AUTH_MODE,
+  google_client_id: GOOGLE_CLIENT_ID || null,
+  providers: { google: !!GOOGLE_CLIENT_ID, linkedin: !!LINKEDIN_CLIENT_ID, facebook: !!FACEBOOK_APP_ID },
+}))
+
+// Verify a social credential → { sub, email, name } or null if that provider isn't configured.
+async function verifySocial(provider, credential) {
+  // Non-production test hook so the social account/link logic can be exercised without real OAuth apps.
+  if (AUTH_MODE !== 'otp_production' && typeof credential === 'string' && credential.startsWith('devtest|')) {
+    const [, email, name] = credential.split('|')
+    return { sub: provider + ':' + email, email, name: name || email }
+  }
+  if (provider === 'google') {
+    if (!GOOGLE_CLIENT_ID) return null
+    if (!credential) throw new Error('Missing Google credential')
+    const r = await fetch('https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(credential))
+    const d = await r.json().catch(() => ({}))
+    if (!d.sub || d.aud !== GOOGLE_CLIENT_ID) throw new Error('Invalid Google token')
+    return { sub: 'google:' + d.sub, email: d.email || null, name: d.name || null }
+  }
+  if (provider === 'linkedin') { if (!LINKEDIN_CLIENT_ID) return null; throw new Error('LinkedIn login needs server OAuth (code exchange) — not finished yet.') }
+  if (provider === 'facebook') { if (!FACEBOOK_APP_ID) return null; throw new Error('Facebook login needs server OAuth — not finished yet.') }
+  return null
+}
+function connectProvider(userId, provider, sub) {
+  const u = find('users', (x) => x.id === userId); if (!u) return
+  const ids = u.social_ids || {}; ids[provider] = sub
+  const patch = { social_ids: ids }; patch[provider + '_connected'] = true
+  update('users', u.id, patch)
+  const p = find('profiles', (x) => x.user_id === userId)
+  if (p) { p[provider + '_connected'] = true; p.completeness = computeCompleteness(p); update('profiles', p.id, p) }
+}
+// Social sign-up / sign-in / re-login / account-linking. If authenticated → links provider to that account.
+app.post('/v1/auth/social', optionalAuth, rateLimit(20, 60000), async (req, res) => {
+  const { provider, credential } = req.body || {}
+  if (!['google', 'linkedin', 'facebook'].includes(provider)) return res.status(400).json({ error: 'Invalid provider' })
+  let identity
+  try { identity = await verifySocial(provider, credential) } catch (e) { return res.status(401).json({ error: e.message }) }
+  if (!identity) return res.status(503).json({ error: provider + ' login is not configured yet.' })
+  // Account linking (already signed in)
+  if (req.userId) {
+    connectProvider(req.userId, provider, identity.sub)
+    return res.json({ ok: true, linked: true, token: issueToken(req.userId), user: find('users', (u) => u.id === req.userId) })
+  }
+  // Sign-in (existing social identity) or sign-up (new)
+  let user = find('users', (u) => u.social_ids && u.social_ids[provider] === identity.sub)
+  let created = false
+  if (!user) {
+    user = insert('users', { id: uuid(), phone: null, email: identity.email || null, created_at: new Date().toISOString(), pledge_taken_at: null, verification_status: 'unverified', phone_verified: false, google_connected: false, linkedin_connected: false, facebook_connected: false, social_ids: {}, trust_score: 42, is_premium: false, status: 'active', slow_mode: false })
+    if (identity.name) insert('profiles', { id: uuid(), user_id: user.id, display_name: identity.name })
+    created = true
+  }
+  if (user.status === 'banned') return res.status(403).json({ error: 'This account has been suspended.' })
+  connectProvider(user.id, provider, identity.sub)
+  res.json({ ok: true, created, token: issueToken(user.id), user: find('users', (u) => u.id === user.id), needs_phone: !user.phone })
 })
 
 app.get('/v1/me', requireAuth, (req, res) => res.json({ ok: true, user: find('users', (u) => u.id === req.userId) }))
