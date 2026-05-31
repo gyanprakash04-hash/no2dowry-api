@@ -224,8 +224,8 @@ const PROFILE_FIELDS = {
   diet: 3, smoking: 2, drinking: 2, fitness: 2, pets: 1,
   // Family (≈7)
   family_type: 3, family_values: 3, siblings: 1,
-  // Photos + Personality + about
-  photos: 6, personality: 3, interests: 4, hobbies: 2, about_me: 3,
+  // Photos + Video + Personality + about
+  photos: 6, video_intro: 4, personality: 3, interests: 4, hobbies: 2, about_me: 3,
   // Marriage preferences (≈10)
   pref_age_min: 2, pref_age_max: 2, pref_religion: 2, pref_location: 2, pref_education: 1, pref_occupation: 1,
   // Relationship expectations (≈8)
@@ -261,7 +261,7 @@ app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); res.
 
 const inConvo = (c, uid) => c && (c.user_a === uid || c.user_b === uid)
 
-app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '2.1.0-sms', storage: pgReady ? 'postgres' : 'memory', otp: SMS_LIVE ? 'sms' : (OTP_LIVE ? 'whatsapp' : 'demo'), push: PUSH_LIVE ? 'on' : 'off', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
+app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '2.2.0-video', storage: pgReady ? 'postgres' : 'memory', otp: SMS_LIVE ? 'sms' : (OTP_LIVE ? 'whatsapp' : 'demo'), push: PUSH_LIVE ? 'on' : 'off', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
 
 // ---- OTP provider: MSG91 (WhatsApp primary + SMS fallback) with demo fallback ----
 // Set these env vars to go live: MSG91_AUTHKEY and MSG91_OTP_TEMPLATE_ID.
@@ -435,6 +435,22 @@ app.put('/v1/profile/photos', requireAuth, (req, res) => {
   update('profiles', p.id, p)
   res.json({ ok: true, photos: clean, completeness: p.completeness })
 })
+// Profile video intro: a short clip hosted on Cloudinary. Pass url:null to remove it.
+app.put('/v1/profile/video', requireAuth, (req, res) => {
+  const { url, public_id } = req.body || {}
+  let p = find('profiles', (x) => x.user_id === req.userId)
+  if (!p) return res.status(400).json({ error: 'Build your profile first.' })
+  if (url === null || url === '') {
+    p.video_intro = null; p.video_intro_public_id = null
+  } else {
+    if (typeof url !== 'string' || !/^https:\/\/res\.cloudinary\.com\//.test(url)) return res.status(400).json({ error: 'Invalid video URL' })
+    p.video_intro = url
+    p.video_intro_public_id = typeof public_id === 'string' ? public_id.slice(0, 200) : null
+  }
+  p.completeness = computeCompleteness(p)
+  update('profiles', p.id, p)
+  res.json({ ok: true, video_intro: p.video_intro || null, completeness: p.completeness })
+})
 app.get('/v1/profile/:userId', requireAuth, (req, res) => {
   const prof = find('profiles', (p) => p.user_id === req.params.userId)
   if (!prof) return res.status(404).json({ error: 'Profile not found' })
@@ -449,7 +465,7 @@ app.get('/v1/profile/:userId', requireAuth, (req, res) => {
       notify(owner, { type: 'profile_view', title: '👀 Someone viewed your profile', body: 'A member just checked out your profile.', data: {} })
     }
   }
-  res.json({ ok: true, profile: { user_id: prof.user_id, display_name: prof.display_name, age: prof.age, city: prof.city, occupation: prof.occupation, interests: prof.interests || [], prompts: prof.prompts || [], kundli: prof.kundli || null, trust_score: u.trust_score, verified: u.verification_status === 'verified', phone_verified: !!u.phone_verified, pledged: !!u.pledge_taken_at, photos: prof.photos || [] } })
+  res.json({ ok: true, profile: { user_id: prof.user_id, display_name: prof.display_name, age: prof.age, city: prof.city, occupation: prof.occupation, interests: prof.interests || [], prompts: prof.prompts || [], kundli: prof.kundli || null, trust_score: u.trust_score, verified: u.verification_status === 'verified', phone_verified: !!u.phone_verified, pledged: !!u.pledge_taken_at, photos: prof.photos || [], video_intro: prof.video_intro || null } })
 })
 
 app.get('/v1/matches/today', requireAuth, (req, res) => {
