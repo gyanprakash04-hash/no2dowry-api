@@ -7,8 +7,17 @@ import cors from 'cors'
 import crypto from 'crypto'
 import pg from 'pg'
 
-const SECRET = process.env.NO2DOWRY_SECRET || 'dev-secret-change-me'
+// --- SECURITY: signing secret is REQUIRED. No insecure default. ---
+const SECRET = process.env.NO2DOWRY_SECRET || ''
+if (!SECRET || SECRET === 'dev-secret-change-me') {
+  console.error('FATAL: NO2DOWRY_SECRET is not set (or is the old default). Set a strong random value in the environment before starting. Refusing to run with a forgeable secret.')
+  process.exit(1)
+}
 const DATABASE_URL = process.env.DATABASE_URL || ''
+// Admin endpoints require this token in the `x-admin-token` header. If unset, admin is fully locked.
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || ''
+// Auth tokens expire after this many days; user re-authenticates via OTP afterwards.
+const TOKEN_MAX_AGE_MS = (Number(process.env.TOKEN_MAX_AGE_DAYS) || 30) * 864e5
 
 /* ---------------- store (in-memory, optionally backed by Postgres) ---------------- */
 const DB = { users: [], profiles: [], otps: [], connections: [], conversations: [], messages: [], videoDates: [], reports: [], subscriptions: [], familyInvites: [], bestieInvites: [] }
@@ -64,8 +73,14 @@ function verifyToken(token) {
   if (!token || !token.includes('.')) return null
   const [payload, sig] = token.split('.')
   const expected = crypto.createHmac('sha256', SECRET).update(payload).digest('base64url')
-  if (sig !== expected) return null
-  try { return JSON.parse(Buffer.from(payload, 'base64url').toString()) } catch { return null }
+  // constant-time compare to avoid timing attacks
+  const a = Buffer.from(sig || ''), b = Buffer.from(expected)
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null
+  let claims
+  try { claims = JSON.parse(Buffer.from(payload, 'base64url').toString()) } catch { return null }
+  // reject expired tokens
+  if (!claims || typeof claims.t !== 'number' || (Date.now() - claims.t) > TOKEN_MAX_AGE_MS) return null
+  return claims
 }
 function requireAuth(req, res, next) {
   const h = req.headers.authorization || ''
@@ -75,6 +90,35 @@ function requireAuth(req, res, next) {
   req.userId = claims.uid
   next()
 }
+// Admin gate: requires the ADMIN_TOKEN in the x-admin-token header. Locked entirely if ADMIN_TOKEN unset.
+function requireAdmin(req, res, next) {
+  if (!ADMIN_TOKEN) return res.status(403).json({ error: 'Admin access is disabled (ADMIN_TOKEN not configured).' })
+  const t = req.headers['x-admin-token'] || ''
+  const a = Buffer.from(String(t)), b = Buffer.from(ADMIN_TOKEN)
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).json({ error: 'Admin authentication required.' })
+  next()
+}
+
+/* ---------------- rate limiting (in-memory sliding window, per IP+route) ---------------- */
+const rlBuckets = new Map()
+function rateLimit(max, windowMs) {
+  return (req, res, next) => {
+    const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || req.socket.remoteAddress || 'unknown'
+    const key = ip + '|' + req.method + req.path + '|' + max + '|' + windowMs
+    const now = Date.now()
+    let arr = rlBuckets.get(key) || []
+    arr = arr.filter((t) => now - t < windowMs)
+    if (arr.length >= max) {
+      res.set('Retry-After', String(Math.ceil(windowMs / 1000)))
+      return res.status(429).json({ error: 'Too many requests — please slow down and try again shortly.' })
+    }
+    arr.push(now)
+    rlBuckets.set(key, arr)
+    next()
+  }
+}
+// periodic cleanup so the map doesn't grow unbounded
+setInterval(() => { const now = Date.now(); for (const [k, arr] of rlBuckets) { if (!arr.some((t) => now - t < 3600000)) rlBuckets.delete(k) } }, 600000).unref?.()
 
 /* ---------------- dowry & harassment shield ---------------- */
 const DOWRY = ['dowry', 'dahej', 'jahez', 'gift to family', 'gifts for the family', 'cash gift', 'what will you give', 'how much will you give', 'car for', 'gold for', 'expect from your family', 'in return for marriage']
@@ -113,13 +157,22 @@ function scorePair(me, other) {
 
 /* ---------------- app ---------------- */
 const app = express()
-app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }))
+app.set('trust proxy', 1) // Render is behind a proxy — needed for correct client IPs in rate limiting
+// CORS: allow only our own origins (comma-separated env, sensible defaults).
+const ALLOWED_ORIGINS = (process.env.CORS_ORIGIN || 'https://app.no2dowry.com,https://no2dowry.com,https://www.no2dowry.com,https://no2dowry.netlify.app').split(',').map((s) => s.trim()).filter(Boolean)
+app.use(cors({
+  origin(origin, cb) {
+    // allow same-origin/no-origin (mobile WebView, curl, health checks) and our allowlisted web origins
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true)
+    return cb(new Error('Not allowed by CORS'))
+  },
+}))
 app.use(express.json({ limit: '1mb' }))
 app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); res.set('X-Frame-Options', 'DENY'); next() })
 
 const inConvo = (c, uid) => c && (c.user_a === uid || c.user_b === uid)
 
-app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '1.2.0', storage: pgReady ? 'postgres' : 'memory', otp: OTP_LIVE ? 'msg91' : 'demo', time: new Date().toISOString() }))
+app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '1.3.0-secure', storage: pgReady ? 'postgres' : 'memory', otp: OTP_LIVE ? 'live' : 'demo', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
 
 // ---- OTP provider: MSG91 (WhatsApp primary + SMS fallback) with demo fallback ----
 // Set these env vars to go live: MSG91_AUTHKEY and MSG91_OTP_TEMPLATE_ID.
@@ -154,7 +207,7 @@ async function otpVerify(phone, code) {
   return data.type === 'success'
 }
 
-app.post('/v1/auth/otp', async (req, res) => {
+app.post('/v1/auth/otp', rateLimit(5, 60000), rateLimit(20, 864e5), async (req, res) => {
   const { phone } = req.body || {}
   if (!phone) return res.status(400).json({ error: 'phone required' })
   try {
@@ -162,7 +215,7 @@ app.post('/v1/auth/otp', async (req, res) => {
     res.json({ ok: true, ...r })
   } catch (e) { res.status(502).json({ error: 'Could not send code: ' + e.message }) }
 })
-app.post('/v1/auth/verify', async (req, res) => {
+app.post('/v1/auth/verify', rateLimit(10, 60000), async (req, res) => {
   const { phone, code } = req.body || {}
   if (!phone || !code) return res.status(400).json({ error: 'phone and code required' })
   let ok = false
@@ -238,7 +291,7 @@ app.get('/v1/matches/today', requireAuth, (req, res) => {
   res.json({ ok: true, date: new Date().toISOString().slice(0, 10), matches })
 })
 
-app.post('/v1/connections', requireAuth, (req, res) => {
+app.post('/v1/connections', requireAuth, rateLimit(30, 60000), (req, res) => {
   const { to_user, opener_message } = req.body || {}
   if (!to_user) return res.status(400).json({ error: 'to_user required' })
   if (to_user === req.userId) return res.status(400).json({ error: "You can't connect with yourself." })
@@ -292,7 +345,7 @@ app.get('/v1/conversations/:id/messages', requireAuth, (req, res) => {
   if (!inConvo(convo, req.userId)) return res.status(403).json({ error: 'Not your conversation.' })
   res.json({ ok: true, messages: filter('messages', (m) => m.conversation_id === convo.id) })
 })
-app.post('/v1/conversations/:id/messages', requireAuth, (req, res) => {
+app.post('/v1/conversations/:id/messages', requireAuth, rateLimit(30, 60000), (req, res) => {
   const convo = find('conversations', (c) => c.id === req.params.id)
   if (!inConvo(convo, req.userId)) return res.status(403).json({ error: 'Not your conversation.' })
   const { body } = req.body || {}
@@ -344,13 +397,13 @@ app.post('/v1/billing/subscribe', requireAuth, (req, res) => {
   res.json({ ok: true, subscription: insert('subscriptions', { id: uuid(), user_id: u.id, plan, status: 'active', current_period_end: until }) })
 })
 
-app.post('/v1/reports', requireAuth, (req, res) => {
+app.post('/v1/reports', requireAuth, rateLimit(20, 3600000), (req, res) => {
   const { target_user, reason, message_id } = req.body || {}
   res.json({ ok: true, report: insert('reports', { id: uuid(), reporter: req.userId, target_user: target_user || null, message_id: message_id || null, reason: reason || 'unspecified', status: 'open', created_at: new Date().toISOString() }) })
 })
 
-app.get('/v1/admin/stats', (req, res) => res.json({ ok: true, users: DB.users.length, verified: filter('users', (u) => u.verification_status === 'verified').length, pledged: filter('users', (u) => u.pledge_taken_at).length, premium: filter('users', (u) => u.is_premium).length, connections: DB.connections.length, conversations: DB.conversations.length, videoDates: DB.videoDates.length, openReports: filter('reports', (r) => r.status === 'open').length }))
-app.get('/v1/admin/flagged', (req, res) => res.json({ ok: true, flaggedMessages: filter('messages', (m) => (m.shield_flags || []).length).map((m) => ({ id: m.id, sender: m.sender, body: m.body, flags: m.shield_flags, severity: m.shield_severity })), openReports: filter('reports', (r) => r.status === 'open') }))
+app.get('/v1/admin/stats', requireAdmin, (req, res) => res.json({ ok: true, users: DB.users.length, verified: filter('users', (u) => u.verification_status === 'verified').length, pledged: filter('users', (u) => u.pledge_taken_at).length, premium: filter('users', (u) => u.is_premium).length, connections: DB.connections.length, conversations: DB.conversations.length, videoDates: DB.videoDates.length, openReports: filter('reports', (r) => r.status === 'open').length }))
+app.get('/v1/admin/flagged', requireAdmin, (req, res) => res.json({ ok: true, flaggedMessages: filter('messages', (m) => (m.shield_flags || []).length).map((m) => ({ id: m.id, sender: m.sender, body: m.body, flags: m.shield_flags, severity: m.shield_severity })), openReports: filter('reports', (r) => r.status === 'open') }))
 
 app.use((req, res) => res.status(404).json({ error: 'Not found', path: req.originalUrl }))
 app.use((err, req, res, next) => { console.error(err); res.status(500).json({ error: 'Server error' }) })
