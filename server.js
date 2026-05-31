@@ -30,7 +30,7 @@ const PUSH_LIVE = !!(webpush && VAPID_PUBLIC && VAPID_PRIVATE)
 if (PUSH_LIVE) { try { webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC, VAPID_PRIVATE) } catch (e) { console.error('VAPID setup failed:', e.message) } }
 
 /* ---------------- store (in-memory, optionally backed by Postgres) ---------------- */
-const DB = { users: [], profiles: [], otps: [], connections: [], conversations: [], messages: [], videoDates: [], reports: [], subscriptions: [], familyInvites: [], bestieInvites: [], blocks: [], modActions: [], notifications: [], pushSubs: [], events: [], errors: [], verifications: [] }
+const DB = { users: [], profiles: [], otps: [], connections: [], conversations: [], messages: [], videoDates: [], reports: [], subscriptions: [], familyInvites: [], bestieInvites: [], blocks: [], modActions: [], notifications: [], pushSubs: [], events: [], errors: [], verifications: [], favorites: [], profileViews: [], settings: [] }
 const uuid = () => crypto.randomUUID()
 const find = (c, fn) => DB[c].find(fn)
 const filter = (c, fn) => DB[c].filter(fn)
@@ -108,6 +108,9 @@ function requireAuth(req, res, next) {
   const u = find('users', (x) => x.id === claims.uid)
   if (!u) return res.status(401).json({ error: 'Account not found — please log in again.' })
   if (u.status === 'banned') return res.status(403).json({ error: 'This account has been suspended for violating our community guidelines.' })
+  // record last-active (throttled to once per 5 min to keep writes light)
+  const now = Date.now()
+  if (!u.last_active_at || now - new Date(u.last_active_at).getTime() > 300000) update('users', u.id, { last_active_at: new Date(now).toISOString() })
   req.userId = claims.uid
   next()
 }
@@ -256,6 +259,48 @@ function computeCompleteness(p) {
   return Math.round((got / total) * 100)
 }
 
+/* ---------------- trust levels, recency, deal-breakers ---------------- */
+// A human "trust level" derived from verifications, the pledge, social links & media.
+function trustLevel(u, p) {
+  u = u || {}; p = p || {}
+  let s = 0
+  if (u.phone_verified) s += 1
+  if (u.verification_status === 'verified') s += 2
+  if (u.pledge_taken_at) s += 1
+  if (u.google_connected || u.linkedin_connected || u.facebook_connected) s += 1
+  if (p.photos && p.photos.length) s += 1
+  if (p.video_intro) s += 1
+  let level = 0, label = 'New member'
+  if (s >= 6) { level = 4; label = 'Gold — fully verified' }
+  else if (s >= 4) { level = 3; label = 'Trusted' }
+  else if (s >= 2) { level = 2; label = 'Established' }
+  else if (s >= 1) { level = 1; label = 'Getting started' }
+  return { level, label, points: s }
+}
+const NEW_MEMBER_MS = 7 * 864e5
+const isNewMember = (u) => !!(u && u.created_at && (Date.now() - new Date(u.created_at).getTime()) < NEW_MEMBER_MS)
+// Last-active label, suppressed when the member has hidden their activity.
+function activeLabel(u, p) {
+  if (!u || !u.last_active_at) return null
+  if (p && p.hide_activity) return null
+  const ms = Date.now() - new Date(u.last_active_at).getTime()
+  if (ms < 10 * 60000) return 'Active now'
+  if (ms < 864e5) return 'Active today'
+  if (ms < 3 * 864e5) return 'Active recently'
+  if (ms < 7 * 864e5) return 'Active this week'
+  return null
+}
+// Does `other` satisfy `me`'s hard deal-breakers? Only filters when both sides have the relevant field.
+function passesDealBreakers(me, other) {
+  const d = me.deal_breakers
+  if (!d || typeof d !== 'object') return true
+  if (d.veg_only && other.diet && /non-veg|eggetarian/i.test(String(other.diet))) return false
+  if (d.no_smoking && other.smoking && /yes|occasional/i.test(String(other.smoking))) return false
+  if (d.no_drinking && other.drinking && /yes|social/i.test(String(other.drinking))) return false
+  if (d.same_religion && me.religion && other.religion && String(me.religion).toLowerCase() !== String(other.religion).toLowerCase()) return false
+  return true
+}
+
 /* ---------------- app ---------------- */
 const app = express()
 app.set('trust proxy', 1) // Render is behind a proxy — needed for correct client IPs in rate limiting
@@ -273,7 +318,7 @@ app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); res.
 
 const inConvo = (c, uid) => c && (c.user_a === uid || c.user_b === uid)
 
-app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '2.4.0-auth', storage: pgReady ? 'postgres' : 'memory', auth_mode: AUTH_MODE, otp: SMS_LIVE ? 'sms' : (OTP_LIVE ? 'whatsapp' : 'demo'), social: { google: !!GOOGLE_CLIENT_ID, linkedin: !!LINKEDIN_CLIENT_ID, facebook: !!FACEBOOK_APP_ID }, push: PUSH_LIVE ? 'on' : 'off', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
+app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '2.6.0-config', storage: pgReady ? 'postgres' : 'memory', auth_mode: AUTH_MODE, otp: SMS_LIVE ? 'sms' : (OTP_LIVE ? 'whatsapp' : 'demo'), social: { google: !!GOOGLE_CLIENT_ID, linkedin: !!LINKEDIN_CLIENT_ID, facebook: !!FACEBOOK_APP_ID }, push: PUSH_LIVE ? 'on' : 'off', maintenance: CONFIG.maintenance, adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
 
 // ---- OTP provider: MSG91 (WhatsApp primary + SMS fallback) with demo fallback ----
 // Set these env vars to go live: MSG91_AUTHKEY and MSG91_OTP_TEMPLATE_ID.
@@ -290,8 +335,10 @@ const SMS_API_URL = process.env.SMS_API_URL || 'http://mysms.streaminbox.in/vb/a
 const SMS_TEMPLATE = process.env.SMS_TEMPLATE || 'Your No2Dowry verification code is {OTP}. Valid for 10 minutes. Do not share it with anyone.'
 const SMS_LIVE = !!(SMS_APIKEY && SMS_SENDERID)
 // AUTH_MODE controls phone verification: 'otp_disabled' (phone required, no code — beta unblocker),
-// 'otp_demo' (fixed code 7291), 'otp_production' (real SMS via gateway). Switch by env only.
-const AUTH_MODE = (process.env.AUTH_MODE || 'otp_disabled').toLowerCase()
+// 'otp_demo' (fixed code 7291), 'otp_production' (real SMS via gateway).
+// The ENV value is the baseline; the admin panel can override it at runtime (persisted in the DB).
+const ENV_AUTH_MODE = (process.env.AUTH_MODE || 'otp_disabled').toLowerCase()
+let AUTH_MODE = ENV_AUTH_MODE
 // Social login: set each provider's client id to enable it (Google works with just the public client id;
 // LinkedIn/Facebook also need their server OAuth set up). Each activates by config only.
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || ''
@@ -302,6 +349,54 @@ const MSG91_AUTHKEY = process.env.MSG91_AUTHKEY || ''
 const MSG91_OTP_TEMPLATE_ID = process.env.MSG91_OTP_TEMPLATE_ID || ''
 const OTP_LIVE = SMS_LIVE || !!(MSG91_AUTHKEY && MSG91_OTP_TEMPLATE_ID)
 const OTP_TTL_MS = 10 * 60000
+
+/* ---------------- runtime app config (admin-controllable feature flags) ----------------
+ * Secrets stay in env (keys, tokens, DB url). The admin panel only flips SWITCHES, which are
+ * persisted to the DB so they survive restarts. Every flag has a safe default so a missing /
+ * malformed config never breaks the app. */
+const CONFIG_DEFAULTS = {
+  auth_mode: '',            // '' = use ENV_AUTH_MODE; else override (otp_disabled|otp_demo|otp_production)
+  providers: { google: true, linkedin: true, facebook: true }, // ANDed with whether env has the credential
+  features: { shortlist: true, video_intro: true, family_managed: true, deal_breakers: true, new_member_boost: true, profile_views: true, completion_nudges: true, push: true, slow_mode: true },
+  daily_match_count: 4,
+  require_photo: false,     // members must add a photo before they can browse matches
+  require_pledge: false,    // members must take the pledge before they can browse matches
+  auto_verify: false,       // selfies are auto-approved (use only when no human reviewer is available)
+  maintenance: false,       // pause new sign-ups + show a banner; existing members keep working
+  maintenance_message: '',
+}
+let CONFIG = JSON.parse(JSON.stringify(CONFIG_DEFAULTS))
+const FLAG_KEYS = Object.keys(CONFIG_DEFAULTS.features)
+// Merge a partial/over object over a base, keeping only recognised keys with valid types/ranges.
+function mergeConfig(base, over) {
+  const out = JSON.parse(JSON.stringify(base))
+  if (!over || typeof over !== 'object') return out
+  if (typeof over.auth_mode === 'string') out.auth_mode = ['', 'otp_disabled', 'otp_demo', 'otp_production'].includes(over.auth_mode) ? over.auth_mode : out.auth_mode
+  if (over.providers) for (const k of ['google', 'linkedin', 'facebook']) if (typeof over.providers[k] === 'boolean') out.providers[k] = over.providers[k]
+  if (over.features) for (const k of FLAG_KEYS) if (typeof over.features[k] === 'boolean') out.features[k] = over.features[k]
+  if (Number.isFinite(Number(over.daily_match_count))) out.daily_match_count = Math.max(1, Math.min(10, Math.round(Number(over.daily_match_count))))
+  for (const k of ['require_photo', 'require_pledge', 'auto_verify', 'maintenance']) if (typeof over[k] === 'boolean') out[k] = over[k]
+  if (typeof over.maintenance_message === 'string') out.maintenance_message = over.maintenance_message.slice(0, 300)
+  return out
+}
+function applyAuthMode() {
+  const m = (CONFIG.auth_mode || ENV_AUTH_MODE).toLowerCase()
+  AUTH_MODE = ['otp_disabled', 'otp_demo', 'otp_production'].includes(m) ? m : ENV_AUTH_MODE
+}
+function loadConfig() {
+  const row = find('settings', (s) => s.id === 'app')
+  if (row && row.data) CONFIG = mergeConfig(CONFIG_DEFAULTS, row.data)
+  applyAuthMode()
+}
+function saveConfig() {
+  const row = find('settings', (s) => s.id === 'app')
+  if (row) { row.data = CONFIG; update('settings', row.id, row) }
+  else insert('settings', { id: 'app', data: CONFIG })
+}
+// A provider is available only if (a) env has its credential AND (b) the admin flag is on.
+const envHasProvider = (p) => ({ google: !!GOOGLE_CLIENT_ID, linkedin: !!LINKEDIN_CLIENT_ID, facebook: !!FACEBOOK_APP_ID }[p])
+const providerEnabled = (p) => !!(CONFIG.providers[p] && envHasProvider(p))
+
 const genCode = () => String(Math.floor(100000 + Math.random() * 900000))
 const toMobile = (p) => { const d = String(p).replace(/\D/g, ''); return d.length === 10 ? '91' + d : d }
 const setOtp = (phone, code) => { const ex = find('otps', (o) => o.phone === phone); if (ex) { ex.code = code; ex.t = Date.now(); persist('otps', ex) } else insert('otps', { id: uuid(), phone, code, t: Date.now() }) }
@@ -375,6 +470,7 @@ app.post('/v1/auth/verify', rateLimit(10, 60000), async (req, res) => {
   // Match by normalized digits so "+91 98…", "98…", "9198…" all map to ONE account (no duplicates).
   const norm = toMobile(phone)
   let user = find('users', (u) => toMobile(u.phone) === norm)
+  if (!user && CONFIG.maintenance) return res.status(503).json({ error: CONFIG.maintenance_message || 'New sign-ups are paused right now. Please check back soon.' })
   if (!user) user = insert('users', { id: uuid(), phone, created_at: new Date().toISOString(), pledge_taken_at: null, verification_status: 'unverified', phone_verified: verified, phone_verified_at: verified ? new Date().toISOString() : null, google_connected: false, linkedin_connected: false, facebook_connected: false, social_ids: {}, trust_score: 42, is_premium: false, status: 'active', slow_mode: false })
   else if (verified && !user.phone_verified) update('users', user.id, { phone_verified: true, phone_verified_at: new Date().toISOString() })
   res.json({ ok: true, token: issueToken(user.id), user: find('users', (u) => u.id === user.id) })
@@ -383,9 +479,32 @@ app.post('/v1/auth/verify', rateLimit(10, 60000), async (req, res) => {
 // What auth methods the client should offer (drives the login UI). Public.
 app.get('/v1/auth/config', (req, res) => res.json({
   ok: true, auth_mode: AUTH_MODE,
-  google_client_id: GOOGLE_CLIENT_ID || null,
-  providers: { google: !!GOOGLE_CLIENT_ID, linkedin: !!LINKEDIN_CLIENT_ID, facebook: !!FACEBOOK_APP_ID },
+  google_client_id: providerEnabled('google') ? GOOGLE_CLIENT_ID : null,
+  providers: { google: providerEnabled('google'), linkedin: providerEnabled('linkedin'), facebook: providerEnabled('facebook') },
 }))
+
+// Full public runtime config: feature flags + maintenance the app reads on load. Public (no secrets).
+app.get('/v1/config', (req, res) => res.json({
+  ok: true, auth_mode: AUTH_MODE,
+  providers: { google: providerEnabled('google'), linkedin: providerEnabled('linkedin'), facebook: providerEnabled('facebook') },
+  google_client_id: providerEnabled('google') ? GOOGLE_CLIENT_ID : null,
+  features: CONFIG.features, daily_match_count: CONFIG.daily_match_count,
+  require_photo: CONFIG.require_photo, require_pledge: CONFIG.require_pledge,
+  maintenance: CONFIG.maintenance, maintenance_message: CONFIG.maintenance_message,
+}))
+
+// --- Admin: read & write the runtime config (feature flags). Behind the admin token. ---
+app.get('/v1/admin/config', requireAdmin, (req, res) => res.json({
+  ok: true, config: CONFIG,
+  // what the environment supports — so the UI can grey out toggles whose secret isn't configured
+  env: { auth_mode: ENV_AUTH_MODE, google: !!GOOGLE_CLIENT_ID, linkedin: !!LINKEDIN_CLIENT_ID, facebook: !!FACEBOOK_APP_ID, sms: SMS_LIVE, push: PUSH_LIVE },
+}))
+app.put('/v1/admin/config', requireAdmin, (req, res) => {
+  CONFIG = mergeConfig(CONFIG, req.body || {}) // merge over current; only valid keys are applied
+  applyAuthMode(); saveConfig()
+  insert('modActions', { id: uuid(), kind: 'config_update', at: new Date().toISOString() })
+  res.json({ ok: true, config: CONFIG })
+})
 
 // Verify a social credential → { sub, email, name } or null if that provider isn't configured.
 async function verifySocial(provider, credential) {
@@ -418,6 +537,9 @@ function connectProvider(userId, provider, sub) {
 app.post('/v1/auth/social', optionalAuth, rateLimit(20, 60000), async (req, res) => {
   const { provider, credential } = req.body || {}
   if (!['google', 'linkedin', 'facebook'].includes(provider)) return res.status(400).json({ error: 'Invalid provider' })
+  // Admin can switch a provider off without a redeploy. (The devtest hook stays available for local testing.)
+  const isDevtest = AUTH_MODE !== 'otp_production' && typeof credential === 'string' && credential.startsWith('devtest|')
+  if (!isDevtest && !providerEnabled(provider)) return res.status(503).json({ error: provider + ' login is not enabled.' })
   let identity
   try { identity = await verifySocial(provider, credential) } catch (e) { return res.status(401).json({ error: e.message }) }
   if (!identity) return res.status(503).json({ error: provider + ' login is not configured yet.' })
@@ -429,6 +551,7 @@ app.post('/v1/auth/social', optionalAuth, rateLimit(20, 60000), async (req, res)
   // Sign-in (existing social identity) or sign-up (new)
   let user = find('users', (u) => u.social_ids && u.social_ids[provider] === identity.sub)
   let created = false
+  if (!user && CONFIG.maintenance) return res.status(503).json({ error: CONFIG.maintenance_message || 'New sign-ups are paused right now. Please check back soon.' })
   if (!user) {
     user = insert('users', { id: uuid(), phone: null, email: identity.email || null, created_at: new Date().toISOString(), pledge_taken_at: null, verification_status: 'unverified', phone_verified: false, google_connected: false, linkedin_connected: false, facebook_connected: false, social_ids: {}, trust_score: 42, is_premium: false, status: 'active', slow_mode: false })
     if (identity.name) insert('profiles', { id: uuid(), user_id: user.id, display_name: identity.name })
@@ -457,6 +580,13 @@ app.post('/v1/verification/selfie', requireAuth, rateLimit(5, 3600000), (req, re
   // clear any earlier pending verification for this user
   const prior = filter('verifications', (v) => v.user_id === req.userId && v.status === 'pending')
   for (const p of prior) { DB.verifications = DB.verifications.filter((x) => x.id !== p.id); if (pgReady) pool.query('DELETE FROM kv WHERE collection=$1 AND id=$2', ['verifications', String(p.id)]).catch(() => {}) }
+  // Auto-verify mode (admin): approve immediately when no human reviewer is available. Selfie not retained.
+  if (CONFIG.auto_verify) {
+    const row = insert('verifications', { id: uuid(), user_id: req.userId, type: 'selfie', status: 'approved', selfie: null, auto: true, created_at: new Date().toISOString(), reviewed_at: new Date().toISOString() })
+    update('users', u.id, { verification_status: 'verified', verified_at: new Date().toISOString(), trust_score: Math.min(100, (u.trust_score || 42) + 20) })
+    notify(u.id, { type: 'verification', title: '✅ You are verified!', body: 'Your identity check passed. Your profile now shows the Verified badge.', data: {} })
+    return res.json({ ok: true, status: 'approved', verification: { id: row.id, status: 'approved' } })
+  }
   const row = insert('verifications', { id: uuid(), user_id: req.userId, type: 'selfie', status: 'pending', selfie: image, created_at: new Date().toISOString() })
   update('users', u.id, { verification_status: 'pending' })
   res.json({ ok: true, status: 'pending', verification: { id: row.id, status: 'pending' } })
@@ -472,7 +602,7 @@ function purgeUser(uid) {
   const convoIds = filter('conversations', (c) => c.user_a === uid || c.user_b === uid).map((c) => c.id)
   const isMine = (row) => row.user_id === uid || row.id === uid || row.from_user === uid || row.to_user === uid ||
     row.requester === uid || row.recipient === uid || row.sender === uid || row.reporter === uid ||
-    row.blocker === uid || row.target === uid || row.target_user === uid ||
+    row.blocker === uid || row.target === uid || row.target_user === uid || row.owner === uid || row.viewer === uid ||
     row.user_a === uid || row.user_b === uid || (row.conversation_id && convoIds.includes(row.conversation_id))
   for (const coll of Object.keys(DB)) {
     const removed = DB[coll].filter(isMine)
@@ -495,6 +625,83 @@ app.post('/v1/slow-mode', requireAuth, (req, res) => {
 })
 
 app.get('/v1/profile', requireAuth, (req, res) => res.json({ ok: true, profile: find('profiles', (p) => p.user_id === req.userId) }))
+// Completion nudges: the highest-value fields the member hasn't filled yet (drives "complete your profile" prompts).
+const NUDGE_LABELS = { photos: 'Add profile photos', video_intro: 'Record a video intro', about_me: 'Write your “About me”', dowry_free_commitment: 'Take the dowry-free commitment', occupation: 'Add your occupation', qualification: 'Add your education', religion: 'Add your religion', city: 'Add your city', height_cm: 'Add your height', diet: 'Add your diet', looking_for: 'Say what you are looking for', ready_to_marry_in: 'Add your marriage timeline', marital_status: 'Add your marital status', mother_tongue: 'Add your mother tongue', q_marriage_meaning: 'Answer: what marriage means to you' }
+app.get('/v1/profile/nudges', requireAuth, (req, res) => {
+  const p = find('profiles', (x) => x.user_id === req.userId)
+  if (!p) return res.json({ ok: true, completeness: 0, nudges: [{ field: 'profile', label: 'Build your profile to start matching', points: 100 }] })
+  const nudges = []
+  for (const [k, w] of Object.entries(PROFILE_FIELDS)) if (NUDGE_LABELS[k] && !filled(p[k])) nudges.push({ field: k, label: NUDGE_LABELS[k], points: w })
+  nudges.sort((a, b) => b.points - a.points)
+  res.json({ ok: true, completeness: computeCompleteness(p), nudges: nudges.slice(0, 6) })
+})
+// Discovery & privacy settings: profile visibility, hide-activity, family-managed, deal-breakers.
+function settingsOf(p) { p = p || {}; return { visibility: p.visibility || 'public', hide_activity: !!p.hide_activity, managed_by: p.managed_by || 'self', family_relation: p.family_relation || '', deal_breakers: p.deal_breakers || { veg_only: false, no_smoking: false, no_drinking: false, same_religion: false } } }
+app.get('/v1/settings', requireAuth, (req, res) => res.json({ ok: true, settings: settingsOf(find('profiles', (x) => x.user_id === req.userId)) }))
+app.put('/v1/settings', requireAuth, (req, res) => {
+  const p = find('profiles', (x) => x.user_id === req.userId)
+  if (!p) return res.status(400).json({ error: 'Build your profile first.' })
+  const b = req.body || {}
+  if (b.visibility === 'public' || b.visibility === 'hidden') p.visibility = b.visibility
+  if (typeof b.hide_activity === 'boolean') p.hide_activity = b.hide_activity
+  if (b.managed_by === 'self' || b.managed_by === 'family') p.managed_by = b.managed_by
+  if (typeof b.family_relation === 'string') p.family_relation = b.family_relation.slice(0, 40)
+  if (b.deal_breakers && typeof b.deal_breakers === 'object') {
+    const d = b.deal_breakers
+    p.deal_breakers = { veg_only: !!d.veg_only, no_smoking: !!d.no_smoking, no_drinking: !!d.no_drinking, same_religion: !!d.same_religion }
+  }
+  update('profiles', p.id, p)
+  res.json({ ok: true, settings: settingsOf(p) })
+})
+// Favorites / shortlist (toggle) + mutual-interest detection.
+app.get('/v1/favorites', requireAuth, (req, res) => {
+  const list = filter('favorites', (f) => f.user_id === req.userId)
+    .sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
+    .map((f) => {
+      const p = find('profiles', (x) => x.user_id === f.target)
+      const tu = find('users', (x) => x.id === f.target) || {}
+      const mutual = !!find('favorites', (x) => x.user_id === f.target && x.target === req.userId)
+      return { user_id: f.target, name: p ? p.display_name : 'Member', age: p ? p.age : null, city: p ? p.city : '', occupation: p ? p.occupation : '', photo: (p && p.photos && p.photos[0]) ? p.photos[0].url : null, trust_score: tu.trust_score, mutual, since: f.created_at }
+    })
+  res.json({ ok: true, favorites: list })
+})
+app.post('/v1/favorites', requireAuth, rateLimit(60, 60000), (req, res) => {
+  if (!CONFIG.features.shortlist) return res.status(403).json({ error: 'Shortlist is currently disabled.' })
+  const { target_user } = req.body || {}
+  if (!target_user || target_user === req.userId) return res.status(400).json({ error: 'Invalid user' })
+  const existing = find('favorites', (f) => f.user_id === req.userId && f.target === target_user)
+  if (existing) {
+    DB.favorites = DB.favorites.filter((f) => f.id !== existing.id)
+    if (pgReady) pool.query('DELETE FROM kv WHERE collection=$1 AND id=$2', ['favorites', String(existing.id)]).catch(() => {})
+    return res.json({ ok: true, favorited: false })
+  }
+  insert('favorites', { id: uuid(), user_id: req.userId, target: target_user, created_at: new Date().toISOString() })
+  // mutual interest: the other person had already shortlisted me
+  let mutual = false
+  if (find('favorites', (f) => f.user_id === target_user && f.target === req.userId)) {
+    mutual = true
+    const meP = find('profiles', (p) => p.user_id === req.userId)
+    const themP = find('profiles', (p) => p.user_id === target_user)
+    const them = find('users', (u) => u.id === target_user)
+    if (them && !them.is_sample) notify(target_user, { type: 'mutual_interest', title: '💞 It’s a mutual interest!', body: ((meP && meP.display_name) || 'Someone') + ' shortlisted you too — say hello!', data: {} })
+    notify(req.userId, { type: 'mutual_interest', title: '💞 It’s a mutual interest!', body: ((themP && themP.display_name) || 'Your match') + ' had already shortlisted you — say hello!', data: {} })
+  }
+  res.json({ ok: true, favorited: true, mutual })
+})
+// Who viewed my profile (distinct viewers, newest first; anonymous views counted separately).
+app.get('/v1/profile-views', requireAuth, (req, res) => {
+  const views = filter('profileViews', (v) => v.owner === req.userId).sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
+  const seen = new Set(); const viewers = []; let anonymous = 0
+  for (const v of views) {
+    if (!v.viewer) { anonymous++; continue }
+    if (seen.has(v.viewer)) continue
+    seen.add(v.viewer)
+    const p = find('profiles', (x) => x.user_id === v.viewer)
+    const vu = find('users', (x) => x.id === v.viewer) || {}
+    viewers.push({ user_id: v.viewer, name: p ? p.display_name : 'Member', age: p ? p.age : null, city: p ? p.city : '', occupation: p ? p.occupation : '', photo: (p && p.photos && p.photos[0]) ? p.photos[0].url : null, trust_score: vu.trust_score, when: v.created_at })
+  }
+  res.json({ ok: true, viewers, anonymous, total: views.length })
+})
 app.put('/v1/profile', requireAuth, (req, res) => {
   const body = req.body || {}
   if (!body.display_name) return res.status(400).json({ error: 'display_name required' })
@@ -546,15 +753,21 @@ app.get('/v1/profile/:userId', requireAuth, (req, res) => {
   const u = find('users', (x) => x.id === req.params.userId) || {}
   // "Someone viewed your profile" — only for real members, not self, not blocked, throttled to 1/hour per viewer→owner
   const owner = req.params.userId
-  if (owner !== req.userId && !u.is_sample && !blockedBetween(req.userId, owner)) {
+  if (CONFIG.features.profile_views && owner !== req.userId && !u.is_sample && !blockedBetween(req.userId, owner)) {
     const key = req.userId + '|' + owner
     const now = Date.now()
     if (!lastView.has(key) || now - lastView.get(key) > 3600000) {
       lastView.set(key, now)
-      notify(owner, { type: 'profile_view', title: '👀 Someone viewed your profile', body: 'A member just checked out your profile.', data: {} })
+      // If the viewer has hidden their activity, the view is recorded anonymously.
+      const viewerProf = find('profiles', (x) => x.user_id === req.userId)
+      const anon = !!(viewerProf && viewerProf.hide_activity)
+      logCapped('profileViews', { id: uuid(), viewer: anon ? null : req.userId, owner, anon, created_at: new Date().toISOString() }, 6000)
+      notify(owner, { type: 'profile_view', title: '👀 Someone viewed your profile', body: (anon ? 'A member' : ((viewerProf && viewerProf.display_name) || 'A member')) + ' just checked out your profile.', data: {} })
     }
   }
-  res.json({ ok: true, profile: { user_id: prof.user_id, display_name: prof.display_name, age: prof.age, city: prof.city, occupation: prof.occupation, interests: prof.interests || [], prompts: prof.prompts || [], kundli: prof.kundli || null, trust_score: u.trust_score, verified: u.verification_status === 'verified', phone_verified: !!u.phone_verified, pledged: !!u.pledge_taken_at, photos: prof.photos || [], video_intro: prof.video_intro || null } })
+  const fav = !!find('favorites', (f) => f.user_id === req.userId && f.target === owner)
+  const tl = trustLevel(u, prof)
+  res.json({ ok: true, profile: { user_id: prof.user_id, display_name: prof.display_name, age: prof.age, city: prof.city, occupation: prof.occupation, interests: prof.interests || [], prompts: prof.prompts || [], kundli: prof.kundli || null, trust_score: u.trust_score, verified: u.verification_status === 'verified', phone_verified: !!u.phone_verified, pledged: !!u.pledge_taken_at, photos: prof.photos || [], video_intro: prof.video_intro || null, trust_level: tl.label, trust_level_n: tl.level, is_new: isNewMember(u), active: activeLabel(u, prof), managed_by: prof.managed_by || 'self', family_relation: prof.family_relation || '', favorited: fav } })
 })
 
 // MATRIMONY DISCOVERY — strict opposite-gender matching (see CORE MATRIMONY MATCHING RULES).
@@ -563,7 +776,10 @@ app.get('/v1/matches/today', requireAuth, (req, res) => {
   const me = find('profiles', (p) => p.user_id === req.userId)
   if (!me) return res.status(400).json({ error: 'Build your profile first.' })
   const u = find('users', (x) => x.id === req.userId)
-  const limit = u && u.slow_mode ? 2 : 4
+  // Admin-controlled gates: members may need a photo / the pledge before they can browse.
+  if (CONFIG.require_photo && !(me.photos && me.photos.length)) return res.json({ ok: true, date: new Date().toISOString().slice(0, 10), matches: [], needs_photo: true, message: 'Add a profile photo to start seeing matches.' })
+  if (CONFIG.require_pledge && !(u && u.pledge_taken_at)) return res.json({ ok: true, date: new Date().toISOString().slice(0, 10), matches: [], needs_pledge: true, message: 'Take the dowry-free pledge to start seeing matches.' })
+  const limit = (u && u.slow_mode && CONFIG.features.slow_mode) ? 2 : CONFIG.daily_match_count
   // RULE 1 + RULE 5: target gender is the opposite of the viewer's gender (future: read a preference).
   const target = oppositeGender(me.gender)
   if (!target) return res.json({ ok: true, date: new Date().toISOString().slice(0, 10), matches: [], needs_gender: true, message: 'Add your gender to your profile to see matches.' })
@@ -571,9 +787,11 @@ app.get('/v1/matches/today', requireAuth, (req, res) => {
   const eligible = filter('profiles', (p) => {
     if (p.user_id === req.userId) return false
     if (normGender(p.gender) !== target) return false
+    if (p.visibility === 'hidden') return false // member hid their profile from discovery
     if (blockedBetween(req.userId, p.user_id)) return false
     const pu = find('users', (x) => x.id === p.user_id)
     if (!pu || pu.status === 'banned') return false
+    if (CONFIG.features.deal_breakers && !passesDealBreakers(me, p)) return false // viewer's hard deal-breakers
     return true
   })
   // RULE 4 (profile quality) + RULE 3 (matrimony priorities) — ranking weight; does not change shown compat %.
@@ -590,13 +808,16 @@ app.get('/v1/matches/today', requireAuth, (req, res) => {
     if (me.city && o.city && me.city === o.city) r += 80
     if ((me.values_quiz || {}).lifeGoals && (o.values_quiz || {}).lifeGoals === (me.values_quiz || {}).lifeGoals) r += 60
     if (o.relocation && /yes|open|will/i.test(String(o.relocation))) r += 40
+    if (CONFIG.features.new_member_boost && isNewMember(ou)) r += 90 // new-member boost: give fresh joiners early visibility
     return r
   }
+  const myFavs = new Set(filter('favorites', (f) => f.user_id === req.userId).map((f) => f.target))
   const matches = eligible.map((o) => ({ o, ...scorePair(me, o) }))
     .sort((a, b) => (b.compat + rank(b.o)) - (a.compat + rank(a.o)))
     .slice(0, limit).map((c) => {
       const ou = find('users', (x) => x.id === c.o.user_id) || {}
-      return { user_id: c.o.user_id, name: c.o.display_name, age: c.o.age, city: c.o.city, occupation: c.o.occupation, interests: c.o.interests, compatibility_score: c.compat, reasons: c.reasons, trust_score: ou.trust_score, photo: (c.o.photos && c.o.photos[0]) ? c.o.photos[0].url : null }
+      const tl = trustLevel(ou, c.o)
+      return { user_id: c.o.user_id, name: c.o.display_name, age: c.o.age, city: c.o.city, occupation: c.o.occupation, interests: c.o.interests, compatibility_score: c.compat, reasons: c.reasons, trust_score: ou.trust_score, photo: (c.o.photos && c.o.photos[0]) ? c.o.photos[0].url : null, trust_level: tl.label, trust_level_n: tl.level, is_new: isNewMember(ou), active: activeLabel(ou, c.o), favorited: myFavs.has(c.o.user_id) }
     })
   res.json({ ok: true, date: new Date().toISOString().slice(0, 10), matches })
 })
@@ -963,6 +1184,8 @@ async function start() {
   try { await initStore() } catch (e) { console.error('Postgres init failed, continuing in-memory:', e.message) }
   if (DB.users.length === 0) { seed(); console.log('Seeded sample members.') }
   else console.log('Loaded ' + DB.users.length + ' existing users; skipping seed.')
+  loadConfig() // load persisted feature flags / runtime config (after store init)
+  console.log('Config loaded — auth_mode=' + AUTH_MODE + (CONFIG.maintenance ? ', MAINTENANCE ON' : ''))
   // Backfill gender on existing sample profiles created before matrimony matching (idempotent).
   const SAMPLE_GENDER = { Aarohi: 'female', Neha: 'female', Vikram: 'male', Rohan: 'male' }
   for (const p of DB.profiles) {
