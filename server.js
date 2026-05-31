@@ -70,15 +70,15 @@ async function initStore() {
 /* ---------------- seed sample members ---------------- */
 function seed() {
   const samples = [
-    { name: 'Aarohi', age: 27, city: 'Pune', occupation: 'Product Designer', interests: ['Travel', 'Books', 'Yoga', 'Startups', 'Dogs'], vq: { lifeGoals: 'marriage_1_2y', familyOutlook: 'modern_close', lifestyle: 'active', communication: 'direct_kind', pace: 'open' }, prompts: [{ q: 'A perfect Sunday is…', a: 'Filter coffee, a long walk, and no alarm.' }, { q: 'I want a partner who…', a: 'laughs easily and disagrees respectfully.' }], kundli: 'High harmony (28/36 gunas) — optional view' },
-    { name: 'Vikram', age: 30, city: 'Bengaluru', occupation: 'Software Engineer', interests: ['Trekking', 'Cooking', 'Cricket', 'Music'], vq: { lifeGoals: 'marriage_1_2y', familyOutlook: 'modern_close', lifestyle: 'outdoors', communication: 'direct_kind', pace: 'slow' }, prompts: [{ q: 'I geek out about…', a: 'trekking routes and badly-made chai.' }, { q: 'My ideal weekend', a: 'A hill, a tent, and no network bars.' }], kundli: 'Good match (24/36 gunas) — optional view' },
-    { name: 'Neha', age: 26, city: 'Pune', occupation: 'Doctor', interests: ['Art', 'Medicine', 'Travel', 'Coffee'], vq: { lifeGoals: 'marriage_1_2y', familyOutlook: 'faith_modern', lifestyle: 'balanced', communication: 'thoughtful', pace: 'slow' }, prompts: [{ q: 'I unwind by…', a: 'painting and ignoring my group chats.' }, { q: 'Family means…', a: 'Sunday lunches that go on for hours.' }], kundli: 'Very high harmony (31/36) — optional view' },
-    { name: 'Rohan', age: 31, city: 'Mumbai', occupation: 'Architect', interests: ['Design', 'Jazz', 'Coffee', 'Cycling'], vq: { lifeGoals: 'serious_no_rush', familyOutlook: 'modern_close', lifestyle: 'slow_living', communication: 'honest', pace: 'slow' }, prompts: [{ q: 'I could talk for hours about…', a: 'old buildings and new cities.' }, { q: 'I want a partner who…', a: 'is calm in chaos.' }], kundli: 'Balanced (22/36) — optional view' },
+    { name: 'Aarohi', age: 27, gender: 'female', city: 'Pune', occupation: 'Product Designer', interests: ['Travel', 'Books', 'Yoga', 'Startups', 'Dogs'], vq: { lifeGoals: 'marriage_1_2y', familyOutlook: 'modern_close', lifestyle: 'active', communication: 'direct_kind', pace: 'open' }, prompts: [{ q: 'A perfect Sunday is…', a: 'Filter coffee, a long walk, and no alarm.' }, { q: 'I want a partner who…', a: 'laughs easily and disagrees respectfully.' }], kundli: 'High harmony (28/36 gunas) — optional view' },
+    { name: 'Vikram', age: 30, gender: 'male', city: 'Bengaluru', occupation: 'Software Engineer', interests: ['Trekking', 'Cooking', 'Cricket', 'Music'], vq: { lifeGoals: 'marriage_1_2y', familyOutlook: 'modern_close', lifestyle: 'outdoors', communication: 'direct_kind', pace: 'slow' }, prompts: [{ q: 'I geek out about…', a: 'trekking routes and badly-made chai.' }, { q: 'My ideal weekend', a: 'A hill, a tent, and no network bars.' }], kundli: 'Good match (24/36 gunas) — optional view' },
+    { name: 'Neha', age: 26, gender: 'female', city: 'Pune', occupation: 'Doctor', interests: ['Art', 'Medicine', 'Travel', 'Coffee'], vq: { lifeGoals: 'marriage_1_2y', familyOutlook: 'faith_modern', lifestyle: 'balanced', communication: 'thoughtful', pace: 'slow' }, prompts: [{ q: 'I unwind by…', a: 'painting and ignoring my group chats.' }, { q: 'Family means…', a: 'Sunday lunches that go on for hours.' }], kundli: 'Very high harmony (31/36) — optional view' },
+    { name: 'Rohan', age: 31, gender: 'male', city: 'Mumbai', occupation: 'Architect', interests: ['Design', 'Jazz', 'Coffee', 'Cycling'], vq: { lifeGoals: 'serious_no_rush', familyOutlook: 'modern_close', lifestyle: 'slow_living', communication: 'honest', pace: 'slow' }, prompts: [{ q: 'I could talk for hours about…', a: 'old buildings and new cities.' }, { q: 'I want a partner who…', a: 'is calm in chaos.' }], kundli: 'Balanced (22/36) — optional view' },
   ]
   for (const s of samples) {
     const id = uuid()
     insert('users', { id, phone: '+91-seed-' + s.name, created_at: new Date().toISOString(), pledge_taken_at: new Date().toISOString(), verification_status: 'verified', phone_verified: true, trust_score: 84, is_premium: false, status: 'active', slow_mode: false, is_sample: true })
-    insert('profiles', { id: uuid(), user_id: id, display_name: s.name, age: s.age, city: s.city, occupation: s.occupation, interests: s.interests, values_quiz: s.vq, prompts: s.prompts, kundli: s.kundli })
+    insert('profiles', { id: uuid(), user_id: id, display_name: s.name, age: s.age, gender: s.gender, city: s.city, occupation: s.occupation, interests: s.interests, values_quiz: s.vq, prompts: s.prompts, kundli: s.kundli })
   }
 }
 
@@ -193,6 +193,16 @@ function detect(text) {
 /* ---------------- matchmaking ---------------- */
 const DIMS = ['lifeGoals', 'familyOutlook', 'lifestyle', 'communication', 'pace']
 function overlap(a, b) { a = a || []; b = b || []; if (!a.length || !b.length) return 0; const sb = new Set(b); return a.filter((x) => sb.has(x)).length / Math.max(a.length, b.length) }
+// Normalize any gender spelling to 'male' / 'female' (or '' if unknown / non-binary).
+// Accepts: male/man/m, female/woman/f. Used for strict matrimony opposite-gender matching.
+function normGender(g) {
+  const s = String(g || '').trim().toLowerCase()
+  if (s === 'm' || s.startsWith('male') || s.startsWith('man')) return 'male'
+  if (s === 'f' || s === 'w' || s.startsWith('female') || s.startsWith('woman')) return 'female'
+  return ''
+}
+const oppositeGender = (g) => { const n = normGender(g); return n === 'male' ? 'female' : n === 'female' ? 'male' : null }
+
 function scorePair(me, other) {
   const mv = me.values_quiz || {}, ov = other.values_quiz || {}
   let sum = 0
@@ -261,7 +271,7 @@ app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); res.
 
 const inConvo = (c, uid) => c && (c.user_a === uid || c.user_b === uid)
 
-app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '2.2.0-video', storage: pgReady ? 'postgres' : 'memory', otp: SMS_LIVE ? 'sms' : (OTP_LIVE ? 'whatsapp' : 'demo'), push: PUSH_LIVE ? 'on' : 'off', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
+app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '2.3.0-matrimony', storage: pgReady ? 'postgres' : 'memory', otp: SMS_LIVE ? 'sms' : (OTP_LIVE ? 'whatsapp' : 'demo'), push: PUSH_LIVE ? 'on' : 'off', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
 
 // ---- OTP provider: MSG91 (WhatsApp primary + SMS fallback) with demo fallback ----
 // Set these env vars to go live: MSG91_AUTHKEY and MSG91_OTP_TEMPLATE_ID.
@@ -468,18 +478,47 @@ app.get('/v1/profile/:userId', requireAuth, (req, res) => {
   res.json({ ok: true, profile: { user_id: prof.user_id, display_name: prof.display_name, age: prof.age, city: prof.city, occupation: prof.occupation, interests: prof.interests || [], prompts: prof.prompts || [], kundli: prof.kundli || null, trust_score: u.trust_score, verified: u.verification_status === 'verified', phone_verified: !!u.phone_verified, pledged: !!u.pledge_taken_at, photos: prof.photos || [], video_intro: prof.video_intro || null } })
 })
 
+// MATRIMONY DISCOVERY — strict opposite-gender matching (see CORE MATRIMONY MATCHING RULES).
+// This is the single discovery surface (Discover / recommendations / suggested all use it).
 app.get('/v1/matches/today', requireAuth, (req, res) => {
   const me = find('profiles', (p) => p.user_id === req.userId)
   if (!me) return res.status(400).json({ error: 'Build your profile first.' })
   const u = find('users', (x) => x.id === req.userId)
   const limit = u && u.slow_mode ? 2 : 4
-  const others = filter('profiles', (p) => p.user_id !== req.userId && !blockedBetween(req.userId, p.user_id))
-  // Visibility boost: profiles 80%+ complete are ranked higher (does not change the shown compat %).
-  const boost = (o) => (computeCompleteness(o) >= 80 ? 1000 : 0)
-  const matches = others.map((o) => ({ o, ...scorePair(me, o) })).sort((a, b) => (b.compat + boost(b.o)) - (a.compat + boost(a.o))).slice(0, limit).map((c) => {
-    const ou = find('users', (x) => x.id === c.o.user_id) || {}
-    return { user_id: c.o.user_id, name: c.o.display_name, age: c.o.age, city: c.o.city, occupation: c.o.occupation, interests: c.o.interests, compatibility_score: c.compat, reasons: c.reasons, trust_score: ou.trust_score, photo: (c.o.photos && c.o.photos[0]) ? c.o.photos[0].url : null }
+  // RULE 1 + RULE 5: target gender is the opposite of the viewer's gender (future: read a preference).
+  const target = oppositeGender(me.gender)
+  if (!target) return res.json({ ok: true, date: new Date().toISOString().slice(0, 10), matches: [], needs_gender: true, message: 'Add your gender to your profile to see matches.' })
+  // RULE 2: eligibility — opposite gender, active, not banned, not blocked, not self.
+  const eligible = filter('profiles', (p) => {
+    if (p.user_id === req.userId) return false
+    if (normGender(p.gender) !== target) return false
+    if (blockedBetween(req.userId, p.user_id)) return false
+    const pu = find('users', (x) => x.id === p.user_id)
+    if (!pu || pu.status === 'banned') return false
+    return true
   })
+  // RULE 4 (profile quality) + RULE 3 (matrimony priorities) — ranking weight; does not change shown compat %.
+  const rank = (o) => {
+    const ou = find('users', (x) => x.id === o.user_id) || {}
+    let r = 0
+    if (computeCompleteness(o) >= 80) r += 1000
+    if (ou.verification_status === 'verified') r += 300
+    if (o.photos && o.photos.length) r += 200
+    if (o.video_intro) r += 150
+    if (ou.pledge_taken_at) r += 150
+    if (me.age && o.age && Math.abs(Number(me.age) - Number(o.age)) <= 5) r += 120
+    if (me.religion && o.religion && me.religion === o.religion) r += 100
+    if (me.city && o.city && me.city === o.city) r += 80
+    if ((me.values_quiz || {}).lifeGoals && (o.values_quiz || {}).lifeGoals === (me.values_quiz || {}).lifeGoals) r += 60
+    if (o.relocation && /yes|open|will/i.test(String(o.relocation))) r += 40
+    return r
+  }
+  const matches = eligible.map((o) => ({ o, ...scorePair(me, o) }))
+    .sort((a, b) => (b.compat + rank(b.o)) - (a.compat + rank(a.o)))
+    .slice(0, limit).map((c) => {
+      const ou = find('users', (x) => x.id === c.o.user_id) || {}
+      return { user_id: c.o.user_id, name: c.o.display_name, age: c.o.age, city: c.o.city, occupation: c.o.occupation, interests: c.o.interests, compatibility_score: c.compat, reasons: c.reasons, trust_score: ou.trust_score, photo: (c.o.photos && c.o.photos[0]) ? c.o.photos[0].url : null }
+    })
   res.json({ ok: true, date: new Date().toISOString().slice(0, 10), matches })
 })
 
@@ -845,6 +884,12 @@ async function start() {
   try { await initStore() } catch (e) { console.error('Postgres init failed, continuing in-memory:', e.message) }
   if (DB.users.length === 0) { seed(); console.log('Seeded sample members.') }
   else console.log('Loaded ' + DB.users.length + ' existing users; skipping seed.')
+  // Backfill gender on existing sample profiles created before matrimony matching (idempotent).
+  const SAMPLE_GENDER = { Aarohi: 'female', Neha: 'female', Vikram: 'male', Rohan: 'male' }
+  for (const p of DB.profiles) {
+    const g = SAMPLE_GENDER[p.display_name]
+    if (g && normGender(p.gender) !== g) { p.gender = g; update('profiles', p.id, p) }
+  }
   app.listen(PORT, () => console.log('No2Dowry API v1.1.0 on port ' + PORT + (pgReady ? ' (Postgres — persistent)' : ' (in-memory)')))
 }
 start()
