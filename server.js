@@ -261,39 +261,71 @@ app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); res.
 
 const inConvo = (c, uid) => c && (c.user_a === uid || c.user_b === uid)
 
-app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '2.0.0-photos', storage: pgReady ? 'postgres' : 'memory', otp: OTP_LIVE ? 'live' : 'demo', push: PUSH_LIVE ? 'on' : 'off', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
+app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '2.1.0-sms', storage: pgReady ? 'postgres' : 'memory', otp: SMS_LIVE ? 'sms' : (OTP_LIVE ? 'whatsapp' : 'demo'), push: PUSH_LIVE ? 'on' : 'off', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
 
 // ---- OTP provider: MSG91 (WhatsApp primary + SMS fallback) with demo fallback ----
 // Set these env vars to go live: MSG91_AUTHKEY and MSG91_OTP_TEMPLATE_ID.
 // Channel order (WhatsApp then SMS) is configured on the MSG91 OTP template/settings.
 // Until the keys are set, OTP runs in DEMO mode (fixed code 7291) so the app keeps working.
+// --- SMS OTP via a generic HTTP SMS gateway (streaminbox/Vduit). We generate, store & verify
+// the code ourselves; the gateway only delivers the text. Set these env vars to go live:
+//   SMS_APIKEY (secret), SMS_SENDERID (6-char DLT sender), SMS_TEMPLATE_ID (DLT template id),
+//   SMS_TEMPLATE (must match your DLT-registered text; use {OTP} where the code goes).
+const SMS_APIKEY = process.env.SMS_APIKEY || ''
+const SMS_SENDERID = process.env.SMS_SENDERID || ''
+const SMS_TEMPLATE_ID = process.env.SMS_TEMPLATE_ID || ''
+const SMS_API_URL = process.env.SMS_API_URL || 'http://mysms.streaminbox.in/vb/apikey.php'
+const SMS_TEMPLATE = process.env.SMS_TEMPLATE || 'Your No2Dowry verification code is {OTP}. Valid for 10 minutes. Do not share it with anyone.'
+const SMS_LIVE = !!(SMS_APIKEY && SMS_SENDERID)
+// legacy MSG91 fallback (kept for compatibility)
 const MSG91_AUTHKEY = process.env.MSG91_AUTHKEY || ''
 const MSG91_OTP_TEMPLATE_ID = process.env.MSG91_OTP_TEMPLATE_ID || ''
-const OTP_LIVE = !!(MSG91_AUTHKEY && MSG91_OTP_TEMPLATE_ID)
+const OTP_LIVE = SMS_LIVE || !!(MSG91_AUTHKEY && MSG91_OTP_TEMPLATE_ID)
+const OTP_TTL_MS = 10 * 60000
+const genCode = () => String(Math.floor(100000 + Math.random() * 900000))
 const toMobile = (p) => { const d = String(p).replace(/\D/g, ''); return d.length === 10 ? '91' + d : d }
+const setOtp = (phone, code) => { const ex = find('otps', (o) => o.phone === phone); if (ex) { ex.code = code; ex.t = Date.now(); persist('otps', ex) } else insert('otps', { id: uuid(), phone, code, t: Date.now() }) }
 
 async function otpSend(phone) {
-  if (!OTP_LIVE) {
-    const ex = find('otps', (o) => o.phone === phone)
-    if (ex) ex.code = '7291'; else insert('otps', { id: uuid(), phone, code: '7291' })
-    return { sent: true, devCode: '7291', channel: 'demo' }
+  if (SMS_LIVE) {
+    const code = genCode()
+    setOtp(phone, code)
+    const msg = SMS_TEMPLATE.replace(/\{OTP\}|\{#var#\}/g, code)
+    const url = SMS_API_URL + '?apikey=' + encodeURIComponent(SMS_APIKEY) + '&senderid=' + encodeURIComponent(SMS_SENDERID) +
+      '&number=' + toMobile(phone) + '&message=' + encodeURIComponent(msg) +
+      (SMS_TEMPLATE_ID ? '&templateid=' + encodeURIComponent(SMS_TEMPLATE_ID) : '') + '&format=json'
+    const r = await fetch(url)
+    const data = await r.json().catch(() => ({}))
+    if (data.status === 'Success' || data.code === '011') return { sent: true, channel: 'sms' }
+    throw new Error(data.description || data.message || ('SMS gateway error ' + (data.code || '')))
   }
-  const url = 'https://control.msg91.com/api/v5/otp?template_id=' + encodeURIComponent(MSG91_OTP_TEMPLATE_ID) +
-    '&mobile=' + toMobile(phone) + '&otp_expiry=10&realTimeResponse=1'
-  const r = await fetch(url, { method: 'POST', headers: { authkey: MSG91_AUTHKEY, 'Content-Type': 'application/json' }, body: '{}' })
-  const data = await r.json().catch(() => ({}))
-  if (data.type === 'success' || r.ok) return { sent: true, channel: 'whatsapp+sms' }
-  throw new Error(data.message || 'OTP send failed')
+  if (MSG91_AUTHKEY && MSG91_OTP_TEMPLATE_ID) {
+    const url = 'https://control.msg91.com/api/v5/otp?template_id=' + encodeURIComponent(MSG91_OTP_TEMPLATE_ID) +
+      '&mobile=' + toMobile(phone) + '&otp_expiry=10&realTimeResponse=1'
+    const r = await fetch(url, { method: 'POST', headers: { authkey: MSG91_AUTHKEY, 'Content-Type': 'application/json' }, body: '{}' })
+    const data = await r.json().catch(() => ({}))
+    if (data.type === 'success' || r.ok) return { sent: true, channel: 'whatsapp+sms' }
+    throw new Error(data.message || 'OTP send failed')
+  }
+  // DEMO: fixed code, no real SMS
+  setOtp(phone, '7291')
+  return { sent: true, devCode: '7291', channel: 'demo' }
 }
 async function otpVerify(phone, code) {
-  if (!OTP_LIVE) {
+  if (SMS_LIVE) {
     const rec = find('otps', (o) => o.phone === phone)
-    return !!(rec && rec.code === String(code))
+    if (!rec || !rec.code) return false
+    if (rec.t && Date.now() - rec.t > OTP_TTL_MS) return false
+    return rec.code === String(code).trim()
   }
-  const url = 'https://control.msg91.com/api/v5/otp/verify?otp=' + encodeURIComponent(code) + '&mobile=' + toMobile(phone)
-  const r = await fetch(url, { headers: { authkey: MSG91_AUTHKEY } })
-  const data = await r.json().catch(() => ({}))
-  return data.type === 'success'
+  if (MSG91_AUTHKEY && MSG91_OTP_TEMPLATE_ID) {
+    const url = 'https://control.msg91.com/api/v5/otp/verify?otp=' + encodeURIComponent(code) + '&mobile=' + toMobile(phone)
+    const r = await fetch(url, { headers: { authkey: MSG91_AUTHKEY } })
+    const data = await r.json().catch(() => ({}))
+    return data.type === 'success'
+  }
+  const rec = find('otps', (o) => o.phone === phone)
+  return !!(rec && rec.code === String(code))
 }
 
 app.post('/v1/auth/otp', rateLimit(5, 60000), rateLimit(20, 864e5), async (req, res) => {
@@ -310,7 +342,9 @@ app.post('/v1/auth/verify', rateLimit(10, 60000), async (req, res) => {
   let ok = false
   try { ok = await otpVerify(phone, code) } catch (e) { return res.status(502).json({ error: 'Verify failed: ' + e.message }) }
   if (!ok) return res.status(401).json({ error: 'Invalid code' })
-  let user = find('users', (u) => u.phone === phone)
+  // Match by normalized digits so "+91 98…", "98…", "9198…" all map to ONE account (no duplicates).
+  const norm = toMobile(phone)
+  let user = find('users', (u) => toMobile(u.phone) === norm)
   if (!user) user = insert('users', { id: uuid(), phone, created_at: new Date().toISOString(), pledge_taken_at: null, verification_status: 'unverified', phone_verified: true, phone_verified_at: new Date().toISOString(), trust_score: 42, is_premium: false, status: 'active', slow_mode: false })
   else if (!user.phone_verified) update('users', user.id, { phone_verified: true, phone_verified_at: new Date().toISOString() })
   res.json({ ok: true, token: issueToken(user.id), user: find('users', (u) => u.id === user.id) })
