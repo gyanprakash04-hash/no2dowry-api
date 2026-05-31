@@ -20,7 +20,7 @@ const ADMIN_TOKEN = process.env.ADMIN_TOKEN || ''
 const TOKEN_MAX_AGE_MS = (Number(process.env.TOKEN_MAX_AGE_DAYS) || 30) * 864e5
 
 /* ---------------- store (in-memory, optionally backed by Postgres) ---------------- */
-const DB = { users: [], profiles: [], otps: [], connections: [], conversations: [], messages: [], videoDates: [], reports: [], subscriptions: [], familyInvites: [], bestieInvites: [] }
+const DB = { users: [], profiles: [], otps: [], connections: [], conversations: [], messages: [], videoDates: [], reports: [], subscriptions: [], familyInvites: [], bestieInvites: [], blocks: [], modActions: [] }
 const uuid = () => crypto.randomUUID()
 const find = (c, fn) => DB[c].find(fn)
 const filter = (c, fn) => DB[c].filter(fn)
@@ -86,10 +86,14 @@ function requireAuth(req, res, next) {
   const h = req.headers.authorization || ''
   const claims = verifyToken(h.startsWith('Bearer ') ? h.slice(7) : null)
   if (!claims) return res.status(401).json({ error: 'Unauthorized — please log in.' })
-  if (!find('users', (u) => u.id === claims.uid)) return res.status(401).json({ error: 'Account not found — please log in again.' })
+  const u = find('users', (x) => x.id === claims.uid)
+  if (!u) return res.status(401).json({ error: 'Account not found — please log in again.' })
+  if (u.status === 'banned') return res.status(403).json({ error: 'This account has been suspended for violating our community guidelines.' })
   req.userId = claims.uid
   next()
 }
+// is there a block in either direction between a and b?
+const blockedBetween = (a, b) => DB.blocks.some((x) => (x.blocker === a && x.target === b) || (x.blocker === b && x.target === a))
 // Admin gate: requires the ADMIN_TOKEN in the x-admin-token header. Locked entirely if ADMIN_TOKEN unset.
 function requireAdmin(req, res, next) {
   if (!ADMIN_TOKEN) return res.status(403).json({ error: 'Admin access is disabled (ADMIN_TOKEN not configured).' })
@@ -206,7 +210,7 @@ app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); res.
 
 const inConvo = (c, uid) => c && (c.user_a === uid || c.user_b === uid)
 
-app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '1.4.0-profiles', storage: pgReady ? 'postgres' : 'memory', otp: OTP_LIVE ? 'live' : 'demo', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
+app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '1.5.0-safety', storage: pgReady ? 'postgres' : 'memory', otp: OTP_LIVE ? 'live' : 'demo', adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
 
 // ---- OTP provider: MSG91 (WhatsApp primary + SMS fallback) with demo fallback ----
 // Set these env vars to go live: MSG91_AUTHKEY and MSG91_OTP_TEMPLATE_ID.
@@ -323,7 +327,7 @@ app.get('/v1/matches/today', requireAuth, (req, res) => {
   if (!me) return res.status(400).json({ error: 'Build your profile first.' })
   const u = find('users', (x) => x.id === req.userId)
   const limit = u && u.slow_mode ? 2 : 4
-  const others = filter('profiles', (p) => p.user_id !== req.userId)
+  const others = filter('profiles', (p) => p.user_id !== req.userId && !blockedBetween(req.userId, p.user_id))
   // Visibility boost: profiles 80%+ complete are ranked higher (does not change the shown compat %).
   const boost = (o) => (computeCompleteness(o) >= 80 ? 1000 : 0)
   const matches = others.map((o) => ({ o, ...scorePair(me, o) })).sort((a, b) => (b.compat + boost(b.o)) - (a.compat + boost(a.o))).slice(0, limit).map((c) => {
@@ -337,6 +341,7 @@ app.post('/v1/connections', requireAuth, rateLimit(30, 60000), (req, res) => {
   const { to_user, opener_message } = req.body || {}
   if (!to_user) return res.status(400).json({ error: 'to_user required' })
   if (to_user === req.userId) return res.status(400).json({ error: "You can't connect with yourself." })
+  if (blockedBetween(req.userId, to_user)) return res.status(403).json({ error: 'You cannot connect with this member.' })
   const row = insert('connections', { id: uuid(), from_user: req.userId, to_user, opener_message: opener_message || '', status: 'pending', created_at: new Date().toISOString() })
   let conversation = null
   const rec = find('users', (u) => u.id === to_user)
@@ -390,6 +395,8 @@ app.get('/v1/conversations/:id/messages', requireAuth, (req, res) => {
 app.post('/v1/conversations/:id/messages', requireAuth, rateLimit(30, 60000), (req, res) => {
   const convo = find('conversations', (c) => c.id === req.params.id)
   if (!inConvo(convo, req.userId)) return res.status(403).json({ error: 'Not your conversation.' })
+  const otherInConvo = convo.user_a === req.userId ? convo.user_b : convo.user_a
+  if (blockedBetween(req.userId, otherInConvo)) return res.status(403).json({ error: 'You can no longer message this member.' })
   const { body } = req.body || {}
   if (!body) return res.status(400).json({ error: 'body required' })
   const shield = detect(body)
@@ -440,12 +447,98 @@ app.post('/v1/billing/subscribe', requireAuth, (req, res) => {
 })
 
 app.post('/v1/reports', requireAuth, rateLimit(20, 3600000), (req, res) => {
-  const { target_user, reason, message_id } = req.body || {}
-  res.json({ ok: true, report: insert('reports', { id: uuid(), reporter: req.userId, target_user: target_user || null, message_id: message_id || null, reason: reason || 'unspecified', status: 'open', created_at: new Date().toISOString() }) })
+  const { target_user, reason, message_id, conversation_id, type } = req.body || {}
+  const report = insert('reports', {
+    id: uuid(), reporter: req.userId, target_user: target_user || null, message_id: message_id || null,
+    conversation_id: conversation_id || null, type: type || 'user', reason: reason || 'unspecified',
+    status: 'open', created_at: new Date().toISOString(),
+  })
+  res.json({ ok: true, report })
+})
+
+/* ---- Block / unblock ---- */
+app.get('/v1/blocks', requireAuth, (req, res) => {
+  res.json({ ok: true, blocks: filter('blocks', (b) => b.blocker === req.userId).map((b) => b.target) })
+})
+app.post('/v1/block', requireAuth, rateLimit(30, 3600000), (req, res) => {
+  const { target_user } = req.body || {}
+  if (!target_user || target_user === req.userId) return res.status(400).json({ error: 'Invalid user' })
+  if (!find('blocks', (b) => b.blocker === req.userId && b.target === target_user)) {
+    insert('blocks', { id: uuid(), blocker: req.userId, target: target_user, created_at: new Date().toISOString() })
+  }
+  res.json({ ok: true, blocked: true })
+})
+app.post('/v1/unblock', requireAuth, (req, res) => {
+  const { target_user } = req.body || {}
+  const b = find('blocks', (x) => x.blocker === req.userId && x.target === target_user)
+  if (b) { DB.blocks = DB.blocks.filter((x) => x.id !== b.id); if (pgReady) pool.query('DELETE FROM kv WHERE collection=$1 AND id=$2', ['blocks', String(b.id)]).catch(() => {}) }
+  res.json({ ok: true, unblocked: true })
 })
 
 app.get('/v1/admin/stats', requireAdmin, (req, res) => res.json({ ok: true, users: DB.users.length, verified: filter('users', (u) => u.verification_status === 'verified').length, pledged: filter('users', (u) => u.pledge_taken_at).length, premium: filter('users', (u) => u.is_premium).length, connections: DB.connections.length, conversations: DB.conversations.length, videoDates: DB.videoDates.length, openReports: filter('reports', (r) => r.status === 'open').length }))
-app.get('/v1/admin/flagged', requireAdmin, (req, res) => res.json({ ok: true, flaggedMessages: filter('messages', (m) => (m.shield_flags || []).length).map((m) => ({ id: m.id, sender: m.sender, body: m.body, flags: m.shield_flags, severity: m.shield_severity })), openReports: filter('reports', (r) => r.status === 'open') }))
+app.get('/v1/admin/flagged', requireAdmin, (req, res) => res.json({ ok: true, flaggedMessages: filter('messages', (m) => (m.shield_flags || []).length && !m.removed).map((m) => ({ id: m.id, sender: m.sender, body: m.body, flags: m.shield_flags, severity: m.shield_severity })), openReports: filter('reports', (r) => r.status === 'open') }))
+
+// helpers for moderation views
+const nameOf = (uid) => { const p = find('profiles', (x) => x.user_id === uid); return p ? p.display_name : null }
+const maskPhone = (ph) => (ph ? String(ph).replace(/.(?=.{3})/g, '•') : null)
+
+// Full moderation report list (open + resolved), newest first, with names + message text
+app.get('/v1/admin/reports', requireAdmin, (req, res) => {
+  const reports = [...DB.reports].sort((a, b) => (b.created_at || '').localeCompare(a.created_at || '')).map((r) => {
+    const msg = r.message_id ? find('messages', (m) => m.id === r.message_id) : null
+    return { ...r, reporter_name: nameOf(r.reporter), target_name: nameOf(r.target_user), message_body: msg ? msg.body : null }
+  })
+  res.json({ ok: true, reports })
+})
+
+// User directory for moderation (phone masked, status, trust, completeness)
+app.get('/v1/admin/users', requireAdmin, (req, res) => {
+  const users = [...DB.users].sort((a, b) => (b.created_at || '').localeCompare(a.created_at || '')).map((u) => {
+    const p = find('profiles', (x) => x.user_id === u.id)
+    return {
+      id: u.id, name: p ? p.display_name : null, phone: maskPhone(u.phone), city: p ? p.city : null,
+      verified: u.verification_status === 'verified', pledged: !!u.pledge_taken_at, premium: !!u.is_premium,
+      trust_score: u.trust_score, status: u.status || 'active', completeness: p ? computeCompleteness(p) : 0,
+      is_sample: !!u.is_sample, created_at: u.created_at,
+    }
+  })
+  res.json({ ok: true, users })
+})
+
+// Resolve / dismiss a report (optionally record the action taken)
+app.post('/v1/admin/reports/:id/resolve', requireAdmin, (req, res) => {
+  const r = find('reports', (x) => x.id === req.params.id)
+  if (!r) return res.status(404).json({ error: 'Report not found' })
+  const { action } = req.body || {}
+  update('reports', r.id, { status: 'resolved', resolved_at: new Date().toISOString(), resolution: action || 'reviewed' })
+  insert('modActions', { id: uuid(), kind: 'resolve_report', report_id: r.id, action: action || 'reviewed', at: new Date().toISOString() })
+  res.json({ ok: true, report: find('reports', (x) => x.id === r.id) })
+})
+
+// Ban / unban a user (banned users are rejected at requireAuth)
+app.post('/v1/admin/users/:id/ban', requireAdmin, (req, res) => {
+  const u = find('users', (x) => x.id === req.params.id)
+  if (!u) return res.status(404).json({ error: 'User not found' })
+  update('users', u.id, { status: 'banned', banned_at: new Date().toISOString() })
+  insert('modActions', { id: uuid(), kind: 'ban', user_id: u.id, at: new Date().toISOString() })
+  res.json({ ok: true, user: { id: u.id, status: 'banned' } })
+})
+app.post('/v1/admin/users/:id/unban', requireAdmin, (req, res) => {
+  const u = find('users', (x) => x.id === req.params.id)
+  if (!u) return res.status(404).json({ error: 'User not found' })
+  update('users', u.id, { status: 'active', banned_at: null })
+  insert('modActions', { id: uuid(), kind: 'unban', user_id: u.id, at: new Date().toISOString() })
+  res.json({ ok: true, user: { id: u.id, status: 'active' } })
+})
+
+// Remove (soft-delete) a flagged/abusive message
+app.post('/v1/admin/messages/:id/remove', requireAdmin, (req, res) => {
+  const m = find('messages', (x) => x.id === req.params.id)
+  if (!m) return res.status(404).json({ error: 'Message not found' })
+  update('messages', m.id, { removed: true, body: '[removed by moderator]', shield_flags: [] })
+  insert('modActions', { id: uuid(), kind: 'remove_message', message_id: m.id, at: new Date().toISOString() })
+  res.json({ ok: true, removed: true })
+})
 
 app.use((req, res) => res.status(404).json({ error: 'Not found', path: req.originalUrl }))
 app.use((err, req, res, next) => { console.error(err); res.status(500).json({ error: 'Server error' }) })
