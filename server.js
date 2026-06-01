@@ -503,7 +503,8 @@ app.put('/v1/admin/config', requireAdmin, (req, res) => {
   CONFIG = mergeConfig(CONFIG, req.body || {}) // merge over current; only valid keys are applied
   applyAuthMode(); saveConfig()
   insert('modActions', { id: uuid(), kind: 'config_update', at: new Date().toISOString() })
-  res.json({ ok: true, config: CONFIG })
+  // Return env too (same shape as GET) so the admin panel can re-render without crashing after a save.
+  res.json({ ok: true, config: CONFIG, env: { auth_mode: ENV_AUTH_MODE, google: !!GOOGLE_CLIENT_ID, linkedin: !!LINKEDIN_CLIENT_ID, facebook: !!FACEBOOK_APP_ID, sms: SMS_LIVE, push: PUSH_LIVE } })
 })
 
 // Verify a social credential → { sub, email, name } or null if that provider isn't configured.
