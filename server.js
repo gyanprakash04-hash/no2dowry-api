@@ -67,19 +67,19 @@ async function initStore() {
   console.log('Connected to Postgres — loaded ' + res.rows.length + ' rows.')
 }
 
-/* ---------------- seed sample members ---------------- */
-function seed() {
-  const samples = [
-    { name: 'Aarohi', age: 27, gender: 'female', city: 'Pune', occupation: 'Product Designer', interests: ['Travel', 'Books', 'Yoga', 'Startups', 'Dogs'], vq: { lifeGoals: 'marriage_1_2y', familyOutlook: 'modern_close', lifestyle: 'active', communication: 'direct_kind', pace: 'open' }, prompts: [{ q: 'A perfect Sunday is…', a: 'Filter coffee, a long walk, and no alarm.' }, { q: 'I want a partner who…', a: 'laughs easily and disagrees respectfully.' }], kundli: 'High harmony (28/36 gunas) — optional view' },
-    { name: 'Vikram', age: 30, gender: 'male', city: 'Bengaluru', occupation: 'Software Engineer', interests: ['Trekking', 'Cooking', 'Cricket', 'Music'], vq: { lifeGoals: 'marriage_1_2y', familyOutlook: 'modern_close', lifestyle: 'outdoors', communication: 'direct_kind', pace: 'slow' }, prompts: [{ q: 'I geek out about…', a: 'trekking routes and badly-made chai.' }, { q: 'My ideal weekend', a: 'A hill, a tent, and no network bars.' }], kundli: 'Good match (24/36 gunas) — optional view' },
-    { name: 'Neha', age: 26, gender: 'female', city: 'Pune', occupation: 'Doctor', interests: ['Art', 'Medicine', 'Travel', 'Coffee'], vq: { lifeGoals: 'marriage_1_2y', familyOutlook: 'faith_modern', lifestyle: 'balanced', communication: 'thoughtful', pace: 'slow' }, prompts: [{ q: 'I unwind by…', a: 'painting and ignoring my group chats.' }, { q: 'Family means…', a: 'Sunday lunches that go on for hours.' }], kundli: 'Very high harmony (31/36) — optional view' },
-    { name: 'Rohan', age: 31, gender: 'male', city: 'Mumbai', occupation: 'Architect', interests: ['Design', 'Jazz', 'Coffee', 'Cycling'], vq: { lifeGoals: 'serious_no_rush', familyOutlook: 'modern_close', lifestyle: 'slow_living', communication: 'honest', pace: 'slow' }, prompts: [{ q: 'I could talk for hours about…', a: 'old buildings and new cities.' }, { q: 'I want a partner who…', a: 'is calm in chaos.' }], kundli: 'Balanced (22/36) — optional view' },
-  ]
-  for (const s of samples) {
-    const id = uuid()
-    insert('users', { id, phone: '+91-seed-' + s.name, created_at: new Date().toISOString(), pledge_taken_at: new Date().toISOString(), verification_status: 'verified', phone_verified: true, trust_score: 84, is_premium: false, status: 'active', slow_mode: false, is_sample: true })
-    insert('profiles', { id: uuid(), user_id: id, display_name: s.name, age: s.age, gender: s.gender, city: s.city, occupation: s.occupation, interests: s.interests, values_quiz: s.vq, prompts: s.prompts, kundli: s.kundli })
+/* ---------------- production hygiene: remove demo/sample profiles ---------------- */
+async function cleanupSamples() {
+  const samples = DB.users.filter((u) => u && (u.is_sample || (typeof u.phone === 'string' && u.phone.startsWith('+91-seed-'))))
+  if (!samples.length) return
+  const ids = new Set(samples.map((u) => u.id))
+  const profs = DB.profiles.filter((p) => ids.has(p.user_id))
+  DB.users = DB.users.filter((u) => !ids.has(u.id))
+  DB.profiles = DB.profiles.filter((p) => !ids.has(p.user_id))
+  if (pgReady) {
+    for (const u of samples) await pool.query('DELETE FROM kv WHERE collection=$1 AND id=$2', ['users', String(u.id)]).catch(() => {})
+    for (const p of profs) await pool.query('DELETE FROM kv WHERE collection=$1 AND id=$2', ['profiles', String(p.id)]).catch(() => {})
   }
+  console.log('Removed ' + samples.length + ' sample/demo profiles (production hygiene).')
 }
 
 /* ---------------- auth ---------------- */
@@ -338,6 +338,8 @@ const SMS_LIVE = !!(SMS_APIKEY && SMS_SENDERID)
 // 'otp_demo' (fixed code 7291), 'otp_production' (real SMS via gateway).
 // The ENV value is the baseline; the admin panel can override it at runtime (persisted in the DB).
 const ENV_AUTH_MODE = (process.env.AUTH_MODE || 'otp_disabled').toLowerCase()
+// PRODUCTION LOCK: secure by default. Dev/Demo/Off auth is only possible if ALLOW_DEV_AUTH=1 is set.
+const ALLOW_DEV_AUTH = process.env.ALLOW_DEV_AUTH === '1'
 let AUTH_MODE = ENV_AUTH_MODE
 // Social login: set each provider's client id to enable it (Google works with just the public client id;
 // LinkedIn/Facebook also need their server OAuth set up). Each activates by config only.
@@ -382,6 +384,9 @@ function mergeConfig(base, over) {
 function applyAuthMode() {
   const m = (CONFIG.auth_mode || ENV_AUTH_MODE).toLowerCase()
   AUTH_MODE = ['otp_disabled', 'otp_demo', 'otp_production'].includes(m) ? m : ENV_AUTH_MODE
+  // PRODUCTION LOCK: unless a developer explicitly opts in (ALLOW_DEV_AUTH=1), force real OTP.
+  // 'Off' (otp_disabled) and 'Demo' (otp_demo) become inert and cannot weaken auth, even from the admin panel.
+  if (!ALLOW_DEV_AUTH) AUTH_MODE = 'otp_production'
 }
 function loadConfig() {
   const row = find('settings', (s) => s.id === 'app')
@@ -497,23 +502,18 @@ app.get('/v1/config', (req, res) => res.json({
 app.get('/v1/admin/config', requireAdmin, (req, res) => res.json({
   ok: true, config: CONFIG,
   // what the environment supports — so the UI can grey out toggles whose secret isn't configured
-  env: { auth_mode: ENV_AUTH_MODE, google: !!GOOGLE_CLIENT_ID, linkedin: !!LINKEDIN_CLIENT_ID, facebook: !!FACEBOOK_APP_ID, sms: SMS_LIVE, push: PUSH_LIVE },
+  env: { auth_mode: ENV_AUTH_MODE, google: !!GOOGLE_CLIENT_ID, linkedin: !!LINKEDIN_CLIENT_ID, facebook: !!FACEBOOK_APP_ID, sms: SMS_LIVE, push: PUSH_LIVE, auth_locked: !ALLOW_DEV_AUTH },
 }))
 app.put('/v1/admin/config', requireAdmin, (req, res) => {
   CONFIG = mergeConfig(CONFIG, req.body || {}) // merge over current; only valid keys are applied
   applyAuthMode(); saveConfig()
   insert('modActions', { id: uuid(), kind: 'config_update', at: new Date().toISOString() })
   // Return env too (same shape as GET) so the admin panel can re-render without crashing after a save.
-  res.json({ ok: true, config: CONFIG, env: { auth_mode: ENV_AUTH_MODE, google: !!GOOGLE_CLIENT_ID, linkedin: !!LINKEDIN_CLIENT_ID, facebook: !!FACEBOOK_APP_ID, sms: SMS_LIVE, push: PUSH_LIVE } })
+  res.json({ ok: true, config: CONFIG, env: { auth_mode: ENV_AUTH_MODE, google: !!GOOGLE_CLIENT_ID, linkedin: !!LINKEDIN_CLIENT_ID, facebook: !!FACEBOOK_APP_ID, sms: SMS_LIVE, push: PUSH_LIVE, auth_locked: !ALLOW_DEV_AUTH } })
 })
 
 // Verify a social credential → { sub, email, name } or null if that provider isn't configured.
 async function verifySocial(provider, credential) {
-  // Non-production test hook so the social account/link logic can be exercised without real OAuth apps.
-  if (AUTH_MODE !== 'otp_production' && typeof credential === 'string' && credential.startsWith('devtest|')) {
-    const [, email, name] = credential.split('|')
-    return { sub: provider + ':' + email, email, name: name || email }
-  }
   if (provider === 'google') {
     if (!GOOGLE_CLIENT_ID) return null
     if (!credential) throw new Error('Missing Google credential')
@@ -538,9 +538,7 @@ function connectProvider(userId, provider, sub) {
 app.post('/v1/auth/social', optionalAuth, rateLimit(20, 60000), async (req, res) => {
   const { provider, credential } = req.body || {}
   if (!['google', 'linkedin', 'facebook'].includes(provider)) return res.status(400).json({ error: 'Invalid provider' })
-  // Admin can switch a provider off without a redeploy. (The devtest hook stays available for local testing.)
-  const isDevtest = AUTH_MODE !== 'otp_production' && typeof credential === 'string' && credential.startsWith('devtest|')
-  if (!isDevtest && !providerEnabled(provider)) return res.status(503).json({ error: provider + ' login is not enabled.' })
+  if (!providerEnabled(provider)) return res.status(503).json({ error: provider + ' login is not enabled.' })
   let identity
   try { identity = await verifySocial(provider, credential) } catch (e) { return res.status(401).json({ error: e.message }) }
   if (!identity) return res.status(503).json({ error: provider + ' login is not configured yet.' })
@@ -1183,16 +1181,10 @@ app.use((err, req, res, next) => { console.error(err); res.status(500).json({ er
 const PORT = process.env.PORT || 4000
 async function start() {
   try { await initStore() } catch (e) { console.error('Postgres init failed, continuing in-memory:', e.message) }
-  if (DB.users.length === 0) { seed(); console.log('Seeded sample members.') }
-  else console.log('Loaded ' + DB.users.length + ' existing users; skipping seed.')
+  await cleanupSamples()
+  console.log('Loaded ' + DB.users.length + ' users (samples purged).')
   loadConfig() // load persisted feature flags / runtime config (after store init)
   console.log('Config loaded — auth_mode=' + AUTH_MODE + (CONFIG.maintenance ? ', MAINTENANCE ON' : ''))
-  // Backfill gender on existing sample profiles created before matrimony matching (idempotent).
-  const SAMPLE_GENDER = { Aarohi: 'female', Neha: 'female', Vikram: 'male', Rohan: 'male' }
-  for (const p of DB.profiles) {
-    const g = SAMPLE_GENDER[p.display_name]
-    if (g && normGender(p.gender) !== g) { p.gender = g; update('profiles', p.id, p) }
-  }
   app.listen(PORT, () => console.log('No2Dowry API v1.1.0 on port ' + PORT + (pgReady ? ' (Postgres — persistent)' : ' (in-memory)')))
 }
 start()
