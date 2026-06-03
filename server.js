@@ -918,15 +918,36 @@ app.post('/v1/conversations/:id/messages', requireAuth, rateLimit(30, 60000), (r
 app.post('/v1/video-dates', requireAuth, (req, res) => {
   const { recipient, proposed_time } = req.body || {}
   if (!recipient) return res.status(400).json({ error: 'recipient required' })
+  // proposed_time is a client-supplied ISO timestamp (user's chosen date/time in their local tz, sent as UTC ISO).
   const row = insert('videoDates', { id: uuid(), requester: req.userId, recipient, proposed_time: proposed_time || null, status: 'requested', room_id: null, created_at: new Date().toISOString() })
+  const meP = find('profiles', (p) => p.user_id === req.userId)
+  notify(recipient, { type: 'general', title: '🎥 Video date request', body: ((meP && meP.display_name) || 'A match') + ' proposed a video date — review it in Meetings.', data: { video_date_id: row.id } })
   res.json({ ok: true, videoDate: row, note: 'Waiting for recipient approval. No call link exists yet.' })
+})
+// List my video dates (as requester or recipient), with counterparty name + status.
+app.get('/v1/video-dates', requireAuth, (req, res) => {
+  const uid = req.userId
+  const nameOf = (id) => { const p = find('profiles', (x) => x.user_id === id); return (p && p.display_name) || 'Member' }
+  const mine = filter('videoDates', (v) => v.requester === uid || v.recipient === uid)
+    .sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
+    .map((v) => ({ id: v.id, status: v.status, proposed_time: v.proposed_time, room_id: v.room_id, created_at: v.created_at, role: v.requester === uid ? 'requester' : 'recipient', with_name: nameOf(v.requester === uid ? v.recipient : v.requester) }))
+  res.json({ ok: true, videoDates: mine })
 })
 app.post('/v1/video-dates/:id/approve', requireAuth, (req, res) => {
   const vd = find('videoDates', (v) => v.id === req.params.id)
   if (!vd) return res.status(404).json({ error: 'Not found' })
   if (vd.recipient !== req.userId) return res.status(403).json({ error: 'Only the recipient can approve.' })
   if (vd.status !== 'approved') update('videoDates', vd.id, { status: 'approved', room_id: 'room_' + uuid().slice(0, 8) })
-  res.json({ ok: true, videoDate: vd })
+  const meP = find('profiles', (p) => p.user_id === req.userId)
+  notify(vd.requester, { type: 'general', title: '✅ Video date approved', body: ((meP && meP.display_name) || 'Your match') + ' approved your video date.', data: { video_date_id: vd.id } })
+  res.json({ ok: true, videoDate: find('videoDates', (v) => v.id === req.params.id) })
+})
+app.post('/v1/video-dates/:id/cancel', requireAuth, (req, res) => {
+  const vd = find('videoDates', (v) => v.id === req.params.id)
+  if (!vd) return res.status(404).json({ error: 'Not found' })
+  if (vd.requester !== req.userId && vd.recipient !== req.userId) return res.status(403).json({ error: 'Not your meeting.' })
+  if (vd.status !== 'cancelled') update('videoDates', vd.id, { status: 'cancelled' })
+  res.json({ ok: true, videoDate: find('videoDates', (v) => v.id === req.params.id) })
 })
 
 app.post('/v1/family-circle', requireAuth, (req, res) => {
