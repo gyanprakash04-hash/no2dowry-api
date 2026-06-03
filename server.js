@@ -38,8 +38,23 @@ const RAZORPAY_LIVE = !!(RAZORPAY_KEY_ID && RAZORPAY_KEY_SECRET)
 if (RAZORPAY_LIVE) console.log('Razorpay payments ENABLED (key_id ' + RAZORPAY_KEY_ID.slice(0, 8) + '…), webhook ' + (RAZORPAY_WEBHOOK_SECRET ? 'configured' : 'NOT set'))
 else console.warn('Razorpay payments DISABLED (RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET not set) — upgrades blocked in production.')
 
+// --- Brevo transactional email (Phase 1: async API + retry + logging; no Redis/queue). ---
+// Safe no-op until BREVO_API_KEY is set: triggers log-and-skip and never break a request flow.
+const BREVO_API_KEY = process.env.BREVO_API_KEY || ''
+const EMAIL_LIVE = !!BREVO_API_KEY
+const APP_URL = process.env.APP_URL || 'https://app.no2dowry.com'
+const SITE_URL = process.env.SITE_URL || 'https://no2dowry.com'
+const BREVO_WEBHOOK_SECRET = process.env.BREVO_WEBHOOK_SECRET || '' // optional ?s= guard on the events webhook
+// Sender routing: notifications from the notify.* subdomain (isolated reputation); receipts/support from primary.
+const SENDERS = {
+  notify: { email: process.env.MAIL_FROM_NOTIFY || 'noreply@notify.no2dowry.com', name: 'No2Dowry' },
+  support: { email: process.env.MAIL_FROM_SUPPORT || 'support@no2dowry.com', name: 'No2Dowry Support' },
+  billing: { email: process.env.MAIL_FROM_BILLING || 'billing@no2dowry.com', name: 'No2Dowry Billing' },
+}
+console.log(EMAIL_LIVE ? 'Brevo email ENABLED' : 'Brevo email DISABLED (BREVO_API_KEY not set) — emails are logged & skipped.')
+
 /* ---------------- store (in-memory, optionally backed by Postgres) ---------------- */
-const DB = { users: [], profiles: [], otps: [], connections: [], conversations: [], messages: [], videoDates: [], reports: [], subscriptions: [], payments: [], familyInvites: [], bestieInvites: [], blocks: [], modActions: [], notifications: [], pushSubs: [], events: [], errors: [], verifications: [], favorites: [], profileViews: [], settings: [] }
+const DB = { users: [], profiles: [], otps: [], connections: [], conversations: [], messages: [], videoDates: [], reports: [], subscriptions: [], payments: [], familyInvites: [], bestieInvites: [], blocks: [], modActions: [], notifications: [], pushSubs: [], events: [], errors: [], verifications: [], favorites: [], profileViews: [], settings: [], emails: [], emailSuppress: [] }
 const uuid = () => crypto.randomUUID()
 const find = (c, fn) => DB[c].find(fn)
 const filter = (c, fn) => DB[c].filter(fn)
@@ -157,6 +172,100 @@ function notify(userId, n) {
   }
   return row
 }
+/* ---------------- Transactional email (Brevo) ---------------- */
+const SELF_URL = process.env.SELF_URL || 'https://no2dowry-api.onrender.com'
+const LOGO_URL = SITE_URL + '/assets/logo.png'
+const unsubToken = (userId) => crypto.createHmac('sha256', SECRET).update('unsub:' + userId).digest('hex').slice(0, 24)
+const isSuppressed = (email) => !!find('emailSuppress', (s) => s.email === String(email || '').toLowerCase())
+function addSuppress(email, reason) {
+  email = String(email || '').toLowerCase(); if (!email || isSuppressed(email)) return
+  insert('emailSuppress', { id: uuid(), email, reason: reason || 'manual', created_at: new Date().toISOString() })
+}
+
+// Reusable responsive + dark-mode-aware base layout. Logo is hosted (no2dowry.com/assets).
+function renderEmail({ heading, preheader, lines = [], cta, footerNote, unsubUrl }) {
+  const btn = cta ? `<tr><td style="padding:8px 0 4px"><a href="${cta.url}" style="background:#C9A24B;color:#1A2B4A;text-decoration:none;font-weight:700;padding:13px 26px;border-radius:10px;display:inline-block">${cta.label}</a></td></tr>` : ''
+  const body = lines.map((l) => `<p style="margin:0 0 14px;color:#33415a;font-size:15px;line-height:1.6">${l}</p>`).join('')
+  const unsub = unsubUrl ? `<p style="margin:10px 0 0;font-size:11px;color:#8a93a3">You receive these because you have a No2Dowry account. <a href="${unsubUrl}" style="color:#8a93a3">Unsubscribe from notifications</a>.</p>` : ''
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark"><meta name="supported-color-schemes" content="light dark">
+<style>@media (max-width:620px){.card{width:100%!important;border-radius:0!important}.pad{padding:24px 18px!important}}
+@media (prefers-color-scheme:dark){.bg{background:#0f1626!important}.card{background:#16203a!important}.txt,.txt p,.txt h1{color:#e7ecf5!important}.muted{color:#9aa6bd!important}}</style></head>
+<body class="bg" style="margin:0;background:#F4F6F9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif">
+<div style="display:none;max-height:0;overflow:hidden;opacity:0">${preheader || heading}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F4F6F9" class="bg"><tr><td align="center" style="padding:24px 12px">
+<table role="presentation" width="600" class="card" cellpadding="0" cellspacing="0" style="width:600px;max-width:600px;background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 2px 14px rgba(26,43,74,.06)">
+<tr><td style="background:#1A2B4A;padding:20px 28px"><img src="${LOGO_URL}" width="40" height="40" alt="No2Dowry" style="vertical-align:middle;border-radius:8px"> <span style="color:#fff;font-weight:800;font-size:18px;vertical-align:middle">No2<span style="color:#E5634D">Dowry</span></span></td></tr>
+<tr><td class="pad txt" style="padding:32px 32px 28px">
+<h1 class="txt" style="margin:0 0 16px;color:#1A2B4A;font-size:21px">${heading}</h1>
+${body}<table role="presentation" cellpadding="0" cellspacing="0">${btn}</table>
+${footerNote ? `<p class="muted" style="margin:18px 0 0;font-size:12px;color:#8a93a3">${footerNote}</p>` : ''}
+</td></tr>
+<tr><td class="pad" style="padding:18px 32px 26px;border-top:1px solid #eef1f5">
+<p class="muted" style="margin:0;font-size:12px;color:#8a93a3">No2Dowry · Verified, dowry-free matrimony · <a href="${SITE_URL}" style="color:#8a93a3">no2dowry.com</a> · Questions? <a href="mailto:support@no2dowry.com" style="color:#8a93a3">support@no2dowry.com</a></p>
+${unsub}</td></tr></table></td></tr></table></body></html>`
+}
+
+// Each template returns { sender, subject, ...renderEmail args }. `n` is notification-type (gets unsubscribe).
+const EMAIL_TEMPLATES = {
+  welcome: (p) => ({ sender: 'support', subject: 'Welcome to No2Dowry 🏅', heading: 'Welcome' + (p.name ? ', ' + p.name : '') + '!', preheader: 'Your dowry-free journey starts here.', lines: ['You’ve joined a community committed to <b>marriage without dowry</b>. Every member takes the pledge, every profile is verified.', 'Complete your profile to start seeing curated matches.'], cta: { label: 'Complete my profile', url: APP_URL } }),
+  profile_reminder: (p) => ({ sender: 'notify', n: 1, subject: 'Finish your No2Dowry profile', heading: 'Your profile is ' + (p.pct || 0) + '% complete', preheader: 'A complete profile gets more visibility.', lines: ['Profiles that are 80%+ complete get higher visibility in Discover and more genuine matches.', 'It takes 2 minutes to finish.'], cta: { label: 'Complete my profile', url: APP_URL } }),
+  verification_approved: () => ({ sender: 'support', subject: 'You’re verified on No2Dowry ✓', heading: 'You’re verified ✓', preheader: 'Your Verified badge is now active.', lines: ['Your selfie was reviewed and approved — your <b>Verified</b> badge is now live. Verified members earn more trust and connections.'], cta: { label: 'See my matches', url: APP_URL } }),
+  match_request: (p) => ({ sender: 'notify', n: 1, subject: 'New connection request on No2Dowry', heading: 'Someone wants to connect 💛', preheader: 'You have a new connection request.', lines: [(p.from ? '<b>' + p.from + '</b>' : 'A verified member') + ' sent you a connection request.', 'Open the app to view their profile and respond.'], cta: { label: 'View request', url: APP_URL } }),
+  match_accepted: (p) => ({ sender: 'notify', n: 1, subject: 'Your connection was accepted 🎉', heading: 'It’s a connection! 🎉', preheader: 'You can now start chatting.', lines: [(p.from ? '<b>' + p.from + '</b>' : 'Your match') + ' accepted your request. You can now chat — say hello!'], cta: { label: 'Open chat', url: APP_URL } }),
+  new_message: (p) => ({ sender: 'notify', n: 1, subject: 'New message on No2Dowry 💬', heading: 'You have a new message', preheader: 'Someone replied to you.', lines: [(p.from ? '<b>' + p.from + '</b>' : 'Your match') + ' sent you a message. Chats are protected by our dowry-shield.'], cta: { label: 'Read message', url: APP_URL } }),
+  meeting_request: (p) => ({ sender: 'notify', n: 1, subject: 'Video date request on No2Dowry 🎥', heading: 'A video date request 🎥', preheader: 'Someone proposed a time to meet.', lines: [(p.from ? '<b>' + p.from + '</b>' : 'Your match') + ' proposed a video date' + (p.when ? ' for <b>' + p.when + '</b>' : '') + '.', 'Approve or decline it in the app — no numbers are ever shared.'], cta: { label: 'Review request', url: APP_URL } }),
+  meeting_accepted: (p) => ({ sender: 'notify', n: 1, subject: 'Your video date is confirmed ✅', heading: 'Video date confirmed ✅', preheader: 'Your meeting is on.', lines: [(p.from ? '<b>' + p.from + '</b>' : 'Your match') + ' approved your video date' + (p.when ? ' for <b>' + p.when + '</b>' : '') + '. A private in-app link appears at the scheduled time.'], cta: { label: 'View meeting', url: APP_URL } }),
+  premium_confirmation: (p) => ({ sender: 'billing', subject: 'Your No2Dowry Premium is active ⭐', heading: 'Premium is active ⭐', preheader: 'Payment received — thank you.', lines: ['Thank you! Your <b>No2Dowry Premium</b> is now active.', 'Amount paid: <b>₹' + (p.amount || 499) + '</b>' + (p.payment_id ? ' · Ref: ' + p.payment_id : ''), p.until ? 'Valid until: <b>' + p.until + '</b>' : ''].filter(Boolean), cta: { label: 'Explore Premium', url: APP_URL }, footerNote: 'This is your payment confirmation. For billing queries, reply to billing@no2dowry.com.' }),
+  inactive_3d: () => ({ sender: 'notify', n: 1, subject: 'New matches are waiting on No2Dowry', heading: 'New matches are waiting', preheader: 'Fresh, curated profiles for you.', lines: ['We’ve curated new verified, dowry-free profiles for you. Take a look — the best matches go fast.'], cta: { label: 'See my matches', url: APP_URL } }),
+  inactive_7d: () => ({ sender: 'notify', n: 1, subject: 'Your matches miss you 💛', heading: 'Come back to No2Dowry', preheader: 'Pick up where you left off.', lines: ['It’s been a week. Verified members are looking for someone like you — pick up where you left off.'], cta: { label: 'Open No2Dowry', url: APP_URL } }),
+}
+
+async function brevoSend(senderKey, to, subject, htmlContent) {
+  const sender = SENDERS[senderKey] || SENDERS.notify
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const r = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST', headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify({ sender, to: [to], subject, htmlContent }),
+      })
+      if (r.ok) { const d = await r.json().catch(() => ({})); return { ok: true, id: d.messageId } }
+      const d = await r.json().catch(() => ({}))
+      if (r.status >= 400 && r.status < 500 && r.status !== 429) return { ok: false, error: 'brevo ' + r.status + ' ' + (d.message || '') } // permanent
+    } catch (e) { /* network — retry */ }
+    await new Promise((res) => setTimeout(res, 600 * (attempt + 1)))
+  }
+  return { ok: false, error: 'brevo failed after retries' }
+}
+
+// Fire-and-forget. NEVER throws into the caller's request flow. No-ops safely if email isn't configured.
+function sendEmail(toEmail, toName, type, params = {}, userId = null) {
+  ;(async () => {
+    try {
+      const tpl = EMAIL_TEMPLATES[type]; if (!tpl) return
+      const email = String(toEmail || '').toLowerCase()
+      const t = tpl(params)
+      const logRow = (status, error) => insert('emails', { id: uuid(), to: email || null, user_id: userId, type, sender: t.sender, status, error: error || null, created_at: new Date().toISOString() })
+      if (!email) return logRow('skipped_no_email')
+      if (isSuppressed(email)) return logRow('skipped_suppressed')
+      const unsubUrl = t.n ? (SELF_URL + '/v1/email/unsubscribe?u=' + encodeURIComponent(userId || '') + '&t=' + unsubToken(userId || '')) : null
+      const html = renderEmail({ heading: t.heading, preheader: t.preheader, lines: t.lines, cta: t.cta, footerNote: t.footerNote, unsubUrl })
+      if (!EMAIL_LIVE) return logRow('skipped_no_key')
+      const r = await brevoSend(t.sender, { email, name: toName || undefined }, t.subject, html)
+      logRow(r.ok ? 'sent' : 'failed', r.error)
+      if (!r.ok) console.error('[email] ' + type + ' to ' + email + ' failed: ' + r.error)
+    } catch (e) { console.error('[email] unexpected error:', e.message) }
+  })()
+}
+// Convenience: resolve a user's email and send (skips silently if the user has no email on file).
+function emailUser(userId, type, params = {}) {
+  const u = find('users', (x) => x.id === userId); if (!u) return
+  if (isEmailUnsubbed(u, type)) return
+  const p = find('profiles', (x) => x.user_id === userId)
+  sendEmail(u.email, p && p.display_name, type, params, userId)
+}
+const isEmailUnsubbed = (u, type) => !!(u.email_unsub && (EMAIL_TEMPLATES[type] || {}).n) // user opted out of notification emails
+
 // throttle "profile viewed" pings: at most one per viewer→owner per hour
 const lastView = new Map()
 // Admin gate: requires the ADMIN_TOKEN in the x-admin-token header. Locked entirely if ADMIN_TOKEN unset.
@@ -569,6 +678,7 @@ app.post('/v1/auth/social', optionalAuth, rateLimit(20, 60000), async (req, res)
   }
   if (user.status === 'banned') return res.status(403).json({ error: 'This account has been suspended.' })
   connectProvider(user.id, provider, identity.sub)
+  if (created) emailUser(user.id, 'welcome', {})
   res.json({ ok: true, created, token: issueToken(user.id), user: find('users', (u) => u.id === user.id), needs_phone: !user.phone })
 })
 
@@ -849,6 +959,7 @@ app.post('/v1/connections', requireAuth, rateLimit(30, 60000), (req, res) => {
     // notify the recipient of a new connection request
     const me = find('profiles', (p) => p.user_id === req.userId)
     notify(to_user, { type: 'connection_request', title: '💛 New connection request', body: (me ? me.display_name : 'Someone') + ' wants to connect with you.', data: { connection_id: row.id } })
+    emailUser(to_user, 'match_request', { from: me ? me.display_name : '' })
   }
   res.json({ ok: true, connection: row, conversation, autoAccepted: !!conversation })
 })
@@ -876,6 +987,7 @@ app.post('/v1/connections/:id/accept', requireAuth, (req, res) => {
   if (!convo) convo = insert('conversations', { id: uuid(), user_a: pair[0], user_b: pair[1], created_at: new Date().toISOString() })
   const me = find('profiles', (p) => p.user_id === req.userId)
   notify(c.from_user, { type: 'connection_accepted', title: '🎉 Connection accepted', body: (me ? me.display_name : 'Your match') + ' accepted your request — say hello!', data: { conversation_id: convo.id } })
+  emailUser(c.from_user, 'match_accepted', { from: me ? me.display_name : '' })
   res.json({ ok: true, connection: c, conversation: convo })
 })
 
@@ -911,6 +1023,8 @@ app.post('/v1/conversations/:id/messages', requireAuth, rateLimit(30, 60000), (r
     // notify the real recipient of a new message
     const me = find('profiles', (p) => p.user_id === req.userId)
     notify(otherId, { type: 'message', title: '💬 ' + (me ? me.display_name : 'New message'), body: body.length > 80 ? body.slice(0, 77) + '…' : body, data: { conversation_id: convo.id } })
+    // email the recipient only if they appear offline (>10 min inactive) — avoids emailing every single message
+    { const ru = find('users', (x) => x.id === otherId); if (ru && (!ru.last_active_at || Date.now() - new Date(ru.last_active_at).getTime() > 600000)) emailUser(otherId, 'new_message', { from: me ? me.display_name : '' }) }
   }
   res.json({ ok: true, message: msg, shield, warning: shield.severity === 'high' ? 'This message was flagged by our safety shield and sent for review.' : null })
 })
@@ -922,6 +1036,7 @@ app.post('/v1/video-dates', requireAuth, (req, res) => {
   const row = insert('videoDates', { id: uuid(), requester: req.userId, recipient, proposed_time: proposed_time || null, status: 'requested', room_id: null, created_at: new Date().toISOString() })
   const meP = find('profiles', (p) => p.user_id === req.userId)
   notify(recipient, { type: 'general', title: '🎥 Video date request', body: ((meP && meP.display_name) || 'A match') + ' proposed a video date — review it in Meetings.', data: { video_date_id: row.id } })
+  emailUser(recipient, 'meeting_request', { from: (meP && meP.display_name) || '', when: row.proposed_time ? new Date(row.proposed_time).toLocaleString('en-IN') : '' })
   res.json({ ok: true, videoDate: row, note: 'Waiting for recipient approval. No call link exists yet.' })
 })
 // List my video dates (as requester or recipient), with counterparty name + status.
@@ -940,6 +1055,7 @@ app.post('/v1/video-dates/:id/approve', requireAuth, (req, res) => {
   if (vd.status !== 'approved') update('videoDates', vd.id, { status: 'approved', room_id: 'room_' + uuid().slice(0, 8) })
   const meP = find('profiles', (p) => p.user_id === req.userId)
   notify(vd.requester, { type: 'general', title: '✅ Video date approved', body: ((meP && meP.display_name) || 'Your match') + ' approved your video date.', data: { video_date_id: vd.id } })
+  emailUser(vd.requester, 'meeting_accepted', { from: (meP && meP.display_name) || '', when: vd.proposed_time ? new Date(vd.proposed_time).toLocaleString('en-IN') : '' })
   res.json({ ok: true, videoDate: find('videoDates', (v) => v.id === req.params.id) })
 })
 app.post('/v1/video-dates/:id/cancel', requireAuth, (req, res) => {
@@ -1000,6 +1116,7 @@ function settlePayment({ order_id, payment_id, plan, user_id, amount, source }) 
   update('payments', pay.id, { status: 'paid', payment_id: payment_id || pay.payment_id, amount: amount || pay.amount, paid_at: new Date().toISOString(), source })
   const r = applyPremium(user_id || pay.user_id, plan || pay.plan)
   console.log('[billing] premium activated', JSON.stringify({ user: user_id || pay.user_id, plan: plan || pay.plan, order_id, payment_id, source, until: r && r.until }))
+  emailUser(user_id || pay.user_id, 'premium_confirmation', { amount: Math.round((amount || pay.amount || 49900) / 100), payment_id: payment_id || (pay && pay.payment_id) || '', until: r && r.until ? new Date(r.until).toLocaleDateString('en-IN') : '' })
   return { activated: true, until: r && r.until }
 }
 
@@ -1210,7 +1327,7 @@ app.get('/v1/admin/analytics', requireAdmin, (req, res) => {
   })
 })
 
-app.get('/v1/admin/stats', requireAdmin, (req, res) => res.json({ ok: true, users: DB.users.length, verified: filter('users', (u) => u.verification_status === 'verified').length, pledged: filter('users', (u) => u.pledge_taken_at).length, premium: filter('users', (u) => u.is_premium).length, connections: DB.connections.length, conversations: DB.conversations.length, videoDates: DB.videoDates.length, openReports: filter('reports', (r) => r.status === 'open').length, pendingVerifications: filter('verifications', (v) => v.status === 'pending').length, events: DB.events.length, errors: DB.errors.length, payments: DB.payments.length, paidPayments: filter('payments', (p) => p.status === 'paid').length, revenueInr: filter('payments', (p) => p.status === 'paid').reduce((s, p) => s + ((p.amount || 0) / 100), 0) }))
+app.get('/v1/admin/stats', requireAdmin, (req, res) => res.json({ ok: true, users: DB.users.length, verified: filter('users', (u) => u.verification_status === 'verified').length, pledged: filter('users', (u) => u.pledge_taken_at).length, premium: filter('users', (u) => u.is_premium).length, connections: DB.connections.length, conversations: DB.conversations.length, videoDates: DB.videoDates.length, openReports: filter('reports', (r) => r.status === 'open').length, pendingVerifications: filter('verifications', (v) => v.status === 'pending').length, events: DB.events.length, errors: DB.errors.length, payments: DB.payments.length, paidPayments: filter('payments', (p) => p.status === 'paid').length, revenueInr: filter('payments', (p) => p.status === 'paid').reduce((s, p) => s + ((p.amount || 0) / 100), 0), emailsSent: filter('emails', (e) => e.status === 'sent').length, emailsFailed: filter('emails', (e) => e.status === 'failed').length, emailsSuppressed: DB.emailSuppress.length, emailLive: EMAIL_LIVE }))
 app.get('/v1/admin/flagged', requireAdmin, (req, res) => res.json({ ok: true, flaggedMessages: filter('messages', (m) => (m.shield_flags || []).length && !m.removed).map((m) => ({ id: m.id, sender: m.sender, body: m.body, flags: m.shield_flags, severity: m.shield_severity })), openReports: filter('reports', (r) => r.status === 'open') }))
 
 // helpers for moderation views
@@ -1287,7 +1404,7 @@ app.post('/v1/admin/verifications/:id/approve', requireAdmin, (req, res) => {
   const v = find('verifications', (x) => x.id === req.params.id)
   if (!v) return res.status(404).json({ error: 'Verification not found' })
   const u = find('users', (x) => x.id === v.user_id)
-  if (u) update('users', u.id, { verification_status: 'verified', verified_at: new Date().toISOString(), trust_score: Math.min(100, (u.trust_score || 42) + 20) })
+  if (u) { update('users', u.id, { verification_status: 'verified', verified_at: new Date().toISOString(), trust_score: Math.min(100, (u.trust_score || 42) + 20) }); emailUser(u.id, 'verification_approved', {}) }
   // approved: keep status, DISCARD the selfie image (don't retain biometrics)
   update('verifications', v.id, { status: 'approved', selfie: null, reviewed_at: new Date().toISOString() })
   insert('modActions', { id: uuid(), kind: 'verify_approve', user_id: v.user_id, at: new Date().toISOString() })
@@ -1314,13 +1431,54 @@ app.post('/v1/admin/messages/:id/remove', requireAdmin, (req, res) => {
   res.json({ ok: true, removed: true })
 })
 
+/* ---- Email: one-click unsubscribe (notification emails) + Brevo events webhook ---- */
+app.get('/v1/email/unsubscribe', (req, res) => {
+  const { u, t } = req.query || {}
+  const page = (msg) => `<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:-apple-system,Segoe UI,Roboto,Arial;background:#F4F6F9;color:#1A2B4A;text-align:center;padding:60px 20px"><h2>No2<span style="color:#E5634D">Dowry</span></h2><p style="color:#33415a">${msg}</p></body>`
+  const user = u && find('users', (x) => x.id === u)
+  if (!user || t !== unsubToken(u)) return res.status(400).send(page('This unsubscribe link is invalid or expired.'))
+  update('users', user.id, { email_unsub: true })
+  if (user.email) addSuppress(user.email, 'unsubscribe')
+  res.send(page('You’ve been unsubscribed from No2Dowry notification emails. You’ll still receive essential account & payment emails. You can re-enable notifications anytime in the app.'))
+})
+app.post('/v1/email/webhook', (req, res) => {
+  if (BREVO_WEBHOOK_SECRET && (req.query.s || '') !== BREVO_WEBHOOK_SECRET) return res.status(401).json({ error: 'bad secret' })
+  // Brevo sends one event object (or array). Hard bounces / spam complaints / blocks → suppress.
+  const evs = Array.isArray(req.body) ? req.body : [req.body || {}]
+  for (const e of evs) {
+    const ev = (e.event || '').toLowerCase(); const email = (e.email || '').toLowerCase()
+    if (!email) continue
+    if (['hard_bounce', 'hardbounce', 'spam', 'complaint', 'blocked', 'invalid_email', 'unsubscribed', 'error'].includes(ev)) addSuppress(email, ev)
+  }
+  res.json({ ok: true })
+})
 app.use((req, res) => res.status(404).json({ error: 'Not found', path: req.originalUrl }))
 app.use((err, req, res, next) => { console.error(err); res.status(500).json({ error: 'Server error' }) })
+
+// Lightweight in-process scheduler (no Redis): profile-completion + 3-day/7-day inactive reminders.
+// Each fires at most once per user (flagged), only for users with an email + not unsubscribed/suppressed.
+function emailSweep() {
+  try {
+    const now = Date.now()
+    for (const u of DB.users) {
+      if (!u.email || u.status === 'banned' || u.email_unsub) continue
+      const created = u.created_at ? new Date(u.created_at).getTime() : now
+      const active = u.last_active_at ? new Date(u.last_active_at).getTime() : created
+      const ageH = (now - created) / 3600000, idleD = (now - active) / 86400000
+      const prof = find('profiles', (p) => p.user_id === u.id)
+      const pct = prof ? computeCompleteness(prof) : 0
+      if (!u.emailed_profile_reminder && ageH > 24 && pct < 60) { update('users', u.id, { emailed_profile_reminder: true }); emailUser(u.id, 'profile_reminder', { pct }); continue }
+      if (!u.emailed_inactive_3d && idleD >= 3 && idleD < 5) { update('users', u.id, { emailed_inactive_3d: true }); emailUser(u.id, 'inactive_3d', {}); continue }
+      if (!u.emailed_inactive_7d && idleD >= 7) { update('users', u.id, { emailed_inactive_7d: true }); emailUser(u.id, 'inactive_7d', {}) }
+    }
+  } catch (e) { console.error('[email] sweep error:', e.message) }
+}
 
 const PORT = process.env.PORT || 4000
 async function start() {
   try { await initStore() } catch (e) { console.error('Postgres init failed, continuing in-memory:', e.message) }
   await cleanupSamples()
+  setTimeout(emailSweep, 30000).unref?.(); setInterval(emailSweep, 6 * 3600000).unref?.() // reminder sweeps
   console.log('Loaded ' + DB.users.length + ' users (samples purged).')
   loadConfig() // load persisted feature flags / runtime config (after store init)
   console.log('Config loaded — auth_mode=' + AUTH_MODE + (CONFIG.maintenance ? ', MAINTENANCE ON' : ''))
