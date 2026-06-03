@@ -25,12 +25,21 @@ let webpush = null
 try { webpush = (await import('web-push')).default } catch { console.warn('web-push not installed — OS push disabled (in-app notifications still work).') }
 const VAPID_PUBLIC = process.env.VAPID_PUBLIC || ''
 const VAPID_PRIVATE = process.env.VAPID_PRIVATE || ''
-const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:no2dowry.ad2click@gmail.com'
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:support@no2dowry.com'
 const PUSH_LIVE = !!(webpush && VAPID_PUBLIC && VAPID_PRIVATE)
 if (PUSH_LIVE) { try { webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC, VAPID_PRIVATE) } catch (e) { console.error('VAPID setup failed:', e.message) } }
 
+// --- Razorpay payments. LIVE only when both keys are present. key_id is public (sent to the client);
+// key_secret + webhook secret stay server-side and are NEVER returned to the client. ---
+const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || ''
+const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || ''
+const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET || ''
+const RAZORPAY_LIVE = !!(RAZORPAY_KEY_ID && RAZORPAY_KEY_SECRET)
+if (RAZORPAY_LIVE) console.log('Razorpay payments ENABLED (key_id ' + RAZORPAY_KEY_ID.slice(0, 8) + '…), webhook ' + (RAZORPAY_WEBHOOK_SECRET ? 'configured' : 'NOT set'))
+else console.warn('Razorpay payments DISABLED (RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET not set) — upgrades blocked in production.')
+
 /* ---------------- store (in-memory, optionally backed by Postgres) ---------------- */
-const DB = { users: [], profiles: [], otps: [], connections: [], conversations: [], messages: [], videoDates: [], reports: [], subscriptions: [], familyInvites: [], bestieInvites: [], blocks: [], modActions: [], notifications: [], pushSubs: [], events: [], errors: [], verifications: [], favorites: [], profileViews: [], settings: [] }
+const DB = { users: [], profiles: [], otps: [], connections: [], conversations: [], messages: [], videoDates: [], reports: [], subscriptions: [], payments: [], familyInvites: [], bestieInvites: [], blocks: [], modActions: [], notifications: [], pushSubs: [], events: [], errors: [], verifications: [], favorites: [], profileViews: [], settings: [] }
 const uuid = () => crypto.randomUUID()
 const find = (c, fn) => DB[c].find(fn)
 const filter = (c, fn) => DB[c].filter(fn)
@@ -108,6 +117,8 @@ function requireAuth(req, res, next) {
   const u = find('users', (x) => x.id === claims.uid)
   if (!u) return res.status(401).json({ error: 'Account not found — please log in again.' })
   if (u.status === 'banned') return res.status(403).json({ error: 'This account has been suspended for violating our community guidelines.' })
+  // premium expiry: if the paid period has lapsed, downgrade so status stays accurate (and persists)
+  if (u.is_premium && u.premium_until && new Date(u.premium_until).getTime() < Date.now()) { update('users', u.id, { is_premium: false }); u.is_premium = false }
   // record last-active (throttled to once per 5 min to keep writes light)
   const now = Date.now()
   if (!u.last_active_at || now - new Date(u.last_active_at).getTime() > 300000) update('users', u.id, { last_active_at: new Date(now).toISOString() })
@@ -313,7 +324,7 @@ app.use(cors({
     return cb(new Error('Not allowed by CORS'))
   },
 }))
-app.use(express.json({ limit: '1mb' }))
+app.use(express.json({ limit: '1mb', verify: (req, _res, buf) => { req.rawBody = buf } })) // keep raw body for webhook signature checks
 app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); res.set('X-Frame-Options', 'DENY'); next() })
 
 const inConvo = (c, uid) => c && (c.user_a === uid || c.user_b === uid)
@@ -929,15 +940,122 @@ app.post('/v1/bestie', requireAuth, (req, res) => {
   res.json({ ok: true, invite: insert('bestieInvites', { id: uuid(), user_id: req.userId, contact, status: 'invited', created_at: new Date().toISOString() }) })
 })
 
-const PLANS = { premium: { name: 'No2Dowry Premium', price_inr: 499 }, elite: { name: 'Verified+ Elite', price_inr: 1499 } }
-app.get('/v1/billing/plans', requireAuth, (req, res) => res.json({ ok: true, plans: PLANS }))
+const PLANS = { premium: { name: 'No2Dowry Premium', price_inr: 499, days: 30 }, elite: { name: 'Verified+ Elite', price_inr: 1499, days: 30 } }
+
+app.get('/v1/billing/plans', requireAuth, (req, res) => res.json({ ok: true, plans: PLANS, razorpay_enabled: RAZORPAY_LIVE, key_id: RAZORPAY_LIVE ? RAZORPAY_KEY_ID : null }))
+
+// Call the Razorpay REST API with Basic auth (key_id:key_secret). No SDK dependency.
+async function razorpayApi(path, method, body) {
+  const auth = Buffer.from(RAZORPAY_KEY_ID + ':' + RAZORPAY_KEY_SECRET).toString('base64')
+  const r = await fetch('https://api.razorpay.com/v1' + path, {
+    method, headers: { Authorization: 'Basic ' + auth, 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  })
+  const data = await r.json().catch(() => ({}))
+  if (!r.ok) throw new Error((data.error && data.error.description) || ('Razorpay HTTP ' + r.status))
+  return data
+}
+
+// Idempotently grant/extend premium. Extends from the later of (now, current premium_until).
+function applyPremium(userId, plan) {
+  const u = find('users', (x) => x.id === userId); if (!u) return null
+  const days = (PLANS[plan] && PLANS[plan].days) || 30
+  const base = u.premium_until && new Date(u.premium_until).getTime() > Date.now() ? new Date(u.premium_until).getTime() : Date.now()
+  const until = new Date(base + days * 864e5).toISOString()
+  update('users', u.id, { is_premium: true, premium_until: until, premium_plan: plan })
+  let sub = find('subscriptions', (s) => s.user_id === userId)
+  if (sub) update('subscriptions', sub.id, { plan, status: 'active', current_period_end: until })
+  else sub = insert('subscriptions', { id: uuid(), user_id: userId, plan, status: 'active', current_period_end: until, created_at: new Date().toISOString() })
+  return { until, sub }
+}
+
+// Settle a payment exactly once. Idempotent on payment_id AND on a paid order — so a duplicate
+// client-verify + webhook (or webhook retries) for the same payment can NEVER double-charge premium.
+function settlePayment({ order_id, payment_id, plan, user_id, amount, source }) {
+  if (payment_id && find('payments', (p) => p.payment_id === payment_id && p.status === 'paid')) return { already: true }
+  let pay = order_id ? find('payments', (p) => p.order_id === order_id) : null
+  if (pay && pay.status === 'paid') return { already: true }
+  if (!pay) pay = insert('payments', { id: uuid(), user_id, plan, order_id: order_id || null, payment_id: payment_id || null, amount: amount || null, currency: 'INR', status: 'created', source, created_at: new Date().toISOString() })
+  update('payments', pay.id, { status: 'paid', payment_id: payment_id || pay.payment_id, amount: amount || pay.amount, paid_at: new Date().toISOString(), source })
+  const r = applyPremium(user_id || pay.user_id, plan || pay.plan)
+  console.log('[billing] premium activated', JSON.stringify({ user: user_id || pay.user_id, plan: plan || pay.plan, order_id, payment_id, source, until: r && r.until }))
+  return { activated: true, until: r && r.until }
+}
+
+// 1) Create a Razorpay order (amount fixed server-side from PLANS — client cannot set the price).
+app.post('/v1/billing/order', requireAuth, rateLimit(10, 60000), async (req, res) => {
+  try {
+    const { plan } = req.body || {}
+    if (!PLANS[plan]) return res.status(400).json({ error: 'Unknown plan' })
+    if (!RAZORPAY_LIVE) return res.status(503).json({ error: 'Payments are not enabled yet. Please try again shortly.' })
+    const u = find('users', (x) => x.id === req.userId)
+    const amount = PLANS[plan].price_inr * 100 // paise
+    const order = await razorpayApi('/orders', 'POST', { amount, currency: 'INR', receipt: ('n2d_' + req.userId + '_' + Date.now()).slice(0, 40), notes: { user_id: req.userId, plan } })
+    insert('payments', { id: uuid(), user_id: req.userId, plan, order_id: order.id, payment_id: null, amount, currency: 'INR', status: 'created', source: 'order', created_at: new Date().toISOString() })
+    res.json({ ok: true, order_id: order.id, amount, currency: 'INR', key_id: RAZORPAY_KEY_ID, plan, name: PLANS[plan].name, description: PLANS[plan].name + ' — 30 days', prefill: { contact: (u && u.phone) || '', email: (u && u.email) || '' } })
+  } catch (e) { console.error('[billing] order error:', e.message); res.status(502).json({ error: 'Could not start payment. Please try again.' }) }
+})
+
+// 2) Verify the client checkout result (HMAC of order_id|payment_id with key_secret) and activate.
+app.post('/v1/billing/verify', requireAuth, (req, res) => {
+  try {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {}
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) return res.status(400).json({ error: 'Missing payment fields' })
+    const expected = crypto.createHmac('sha256', RAZORPAY_KEY_SECRET).update(razorpay_order_id + '|' + razorpay_payment_id).digest('hex')
+    const a = Buffer.from(expected), b = Buffer.from(String(razorpay_signature))
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      const pay = find('payments', (p) => p.order_id === razorpay_order_id); if (pay && pay.status !== 'paid') update('payments', pay.id, { status: 'signature_failed' })
+      console.warn('[billing] verify signature mismatch for order', razorpay_order_id)
+      return res.status(400).json({ error: 'Payment could not be verified.' })
+    }
+    const pay = find('payments', (p) => p.order_id === razorpay_order_id)
+    if (pay && pay.user_id && pay.user_id !== req.userId) return res.status(403).json({ error: 'This order belongs to another account.' })
+    const result = settlePayment({ order_id: razorpay_order_id, payment_id: razorpay_payment_id, plan: (pay && pay.plan) || 'premium', user_id: req.userId, source: 'client_verify' })
+    const u = find('users', (x) => x.id === req.userId)
+    res.json({ ok: true, premium: !!(u && u.is_premium), premium_until: u && u.premium_until, already: !!result.already, user: u })
+  } catch (e) { console.error('[billing] verify error:', e.message); res.status(500).json({ error: 'Verification error. If money was deducted it will be confirmed shortly.' }) }
+})
+
+// 3) Razorpay webhook — the authoritative confirmation. Validates X-Razorpay-Signature over the RAW body.
+//    Idempotent; returns 5xx on transient processing errors so Razorpay retries (retry handling).
+app.post('/v1/billing/webhook', (req, res) => {
+  if (!RAZORPAY_WEBHOOK_SECRET) return res.status(503).json({ error: 'webhook not configured' })
+  const sig = String(req.headers['x-razorpay-signature'] || '')
+  const raw = req.rawBody || Buffer.from(JSON.stringify(req.body || {}))
+  const expected = crypto.createHmac('sha256', RAZORPAY_WEBHOOK_SECRET).update(raw).digest('hex')
+  const a = Buffer.from(expected), b = Buffer.from(sig)
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) { console.warn('[billing] webhook signature mismatch'); return res.status(400).json({ error: 'invalid signature' }) }
+  try {
+    const event = req.body && req.body.event
+    const payE = req.body && req.body.payload && req.body.payload.payment && req.body.payload.payment.entity
+    const orderE = req.body && req.body.payload && req.body.payload.order && req.body.payload.order.entity
+    if (event === 'payment.captured' || event === 'order.paid') {
+      const order_id = (payE && payE.order_id) || (orderE && orderE.id)
+      const payment_id = payE && payE.id
+      const existing = order_id && find('payments', (p) => p.order_id === order_id)
+      const notes = (payE && payE.notes) || (orderE && orderE.notes) || {}
+      const user_id = notes.user_id || (existing && existing.user_id)
+      const plan = notes.plan || (existing && existing.plan) || 'premium'
+      if (user_id) settlePayment({ order_id, payment_id, plan, user_id, amount: payE && payE.amount, source: 'webhook' })
+      else console.warn('[billing] webhook: could not resolve user for order', order_id)
+    } else if (event === 'payment.failed') {
+      const order_id = payE && payE.order_id
+      const pay = order_id && find('payments', (p) => p.order_id === order_id)
+      if (pay && pay.status !== 'paid') update('payments', pay.id, { status: 'failed', failed_at: new Date().toISOString(), error: (payE && payE.error_description) || '' })
+      console.log('[billing] payment.failed for order', order_id)
+    }
+    res.json({ ok: true })
+  } catch (e) { console.error('[billing] webhook processing error:', e.message); res.status(500).json({ error: 'processing error' }) } // 5xx → Razorpay retries; settle is idempotent
+})
+
+// Legacy/no-payment path: only works when Razorpay is NOT configured (local/demo). In production
+// (RAZORPAY_LIVE) it refuses, so there is no way to get premium without a real, verified payment.
 app.post('/v1/billing/subscribe', requireAuth, (req, res) => {
+  if (RAZORPAY_LIVE) return res.status(400).json({ error: 'Please complete the secure checkout to upgrade.' })
   const { plan } = req.body || {}
   if (!PLANS[plan]) return res.status(400).json({ error: 'Unknown plan' })
-  const u = find('users', (x) => x.id === req.userId)
-  const until = new Date(Date.now() + 30 * 864e5).toISOString()
-  update('users', u.id, { is_premium: true, premium_until: until })
-  res.json({ ok: true, subscription: insert('subscriptions', { id: uuid(), user_id: u.id, plan, status: 'active', current_period_end: until }) })
+  const r = applyPremium(req.userId, plan)
+  res.json({ ok: true, demo: true, subscription: r && r.sub })
 })
 
 app.post('/v1/reports', requireAuth, rateLimit(20, 3600000), (req, res) => {
@@ -1071,7 +1189,7 @@ app.get('/v1/admin/analytics', requireAdmin, (req, res) => {
   })
 })
 
-app.get('/v1/admin/stats', requireAdmin, (req, res) => res.json({ ok: true, users: DB.users.length, verified: filter('users', (u) => u.verification_status === 'verified').length, pledged: filter('users', (u) => u.pledge_taken_at).length, premium: filter('users', (u) => u.is_premium).length, connections: DB.connections.length, conversations: DB.conversations.length, videoDates: DB.videoDates.length, openReports: filter('reports', (r) => r.status === 'open').length, pendingVerifications: filter('verifications', (v) => v.status === 'pending').length, events: DB.events.length, errors: DB.errors.length }))
+app.get('/v1/admin/stats', requireAdmin, (req, res) => res.json({ ok: true, users: DB.users.length, verified: filter('users', (u) => u.verification_status === 'verified').length, pledged: filter('users', (u) => u.pledge_taken_at).length, premium: filter('users', (u) => u.is_premium).length, connections: DB.connections.length, conversations: DB.conversations.length, videoDates: DB.videoDates.length, openReports: filter('reports', (r) => r.status === 'open').length, pendingVerifications: filter('verifications', (v) => v.status === 'pending').length, events: DB.events.length, errors: DB.errors.length, payments: DB.payments.length, paidPayments: filter('payments', (p) => p.status === 'paid').length, revenueInr: filter('payments', (p) => p.status === 'paid').reduce((s, p) => s + ((p.amount || 0) / 100), 0) }))
 app.get('/v1/admin/flagged', requireAdmin, (req, res) => res.json({ ok: true, flaggedMessages: filter('messages', (m) => (m.shield_flags || []).length && !m.removed).map((m) => ({ id: m.id, sender: m.sender, body: m.body, flags: m.shield_flags, severity: m.shield_severity })), openReports: filter('reports', (r) => r.status === 'open') }))
 
 // helpers for moderation views
