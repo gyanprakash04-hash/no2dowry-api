@@ -54,7 +54,7 @@ const SENDERS = {
 console.log(EMAIL_LIVE ? 'Brevo email ENABLED' : 'Brevo email DISABLED (BREVO_API_KEY not set) — emails are logged & skipped.')
 
 /* ---------------- store (in-memory, optionally backed by Postgres) ---------------- */
-const DB = { users: [], profiles: [], otps: [], connections: [], conversations: [], messages: [], videoDates: [], reports: [], subscriptions: [], payments: [], familyInvites: [], bestieInvites: [], blocks: [], modActions: [], notifications: [], pushSubs: [], events: [], errors: [], verifications: [], favorites: [], profileViews: [], settings: [], emails: [], emailSuppress: [] }
+const DB = { users: [], profiles: [], otps: [], connections: [], conversations: [], messages: [], videoDates: [], reports: [], subscriptions: [], payments: [], familyInvites: [], bestieInvites: [], blocks: [], modActions: [], notifications: [], pushSubs: [], events: [], errors: [], verifications: [], favorites: [], profileViews: [], settings: [], emails: [], emailSuppress: [], contacts: [], newsletter: [] }
 const uuid = () => crypto.randomUUID()
 const find = (c, fn) => DB[c].find(fn)
 const filter = (c, fn) => DB[c].filter(fn)
@@ -328,19 +328,33 @@ const oppositeGender = (g) => { const n = normGender(g); return n === 'male' ? '
 
 function scorePair(me, other) {
   const mv = me.values_quiz || {}, ov = other.values_quiz || {}
+  const per = {} // per-dimension agreement, 0..1
   let sum = 0
   const same = []
-  for (const d of DIMS) { if (mv[d] && ov[d]) { if (mv[d] === ov[d]) { sum += 1; same.push(d) } else sum += 0.45 } else sum += 0.5 }
+  for (const d of DIMS) {
+    let v
+    if (mv[d] && ov[d]) { v = (mv[d] === ov[d]) ? 1 : 0.45; if (mv[d] === ov[d]) same.push(d) }
+    else v = 0.5
+    per[d] = v; sum += v
+  }
   const dim = sum / DIMS.length
   const inter = overlap(me.interests, other.interests)
   const compat = Math.round(60 + (0.7 * dim + 0.3 * inter) * 39)
+  // Named compatibility subscores (server-side, returned to the UI; same 60–99 scale as compat).
+  const pct = (x) => Math.round(60 + Math.max(0, Math.min(1, x)) * 39)
+  const subscores = {
+    values: pct((per.familyOutlook + per.communication) / 2),
+    lifestyle: pct(0.7 * ((per.lifestyle + per.pace) / 2) + 0.3 * inter),
+    family: pct(per.familyOutlook),
+    future: pct((per.lifeGoals + per.pace) / 2),
+  }
   const label = { lifeGoals: 'want the same things from the next few years', familyOutlook: 'share a modern-but-family-close outlook', lifestyle: 'live at a similar rhythm', communication: 'communicate in a similar way', pace: 'want to move at a similar pace' }
   const why = []
   same.slice(0, 2).forEach((d) => why.push('You both ' + label[d]))
   const shared = (me.interests || []).filter((x) => (other.interests || []).includes(x))
   if (shared.length) why.push('Shared interests: ' + shared.slice(0, 3).join(', '))
   if (!why.length) why.push('A balanced match worth exploring')
-  return { compat, reasons: why }
+  return { compat, reasons: why, subscores }
 }
 
 /* ---------------- profile schema & completeness ---------------- */
@@ -356,7 +370,7 @@ const PROFILE_FIELDS = {
   // Lifestyle (≈10)
   diet: 3, smoking: 2, drinking: 2, fitness: 2, pets: 1,
   // Family (≈7)
-  family_type: 3, family_values: 3, siblings: 1,
+  family_type: 3, family_values: 3, siblings: 1, father_occupation: 1, mother_occupation: 1,
   // Photos + Video + Personality + about
   photos: 6, video_intro: 4, personality: 3, interests: 4, hobbies: 2, about_me: 3,
   // Marriage preferences (≈10)
@@ -438,7 +452,25 @@ app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); res.
 
 const inConvo = (c, uid) => c && (c.user_a === uid || c.user_b === uid)
 
-app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '2.6.0-config', storage: pgReady ? 'postgres' : 'memory', auth_mode: AUTH_MODE, otp: SMS_LIVE ? 'sms' : (OTP_LIVE ? 'whatsapp' : 'demo'), social: { google: !!GOOGLE_CLIENT_ID, linkedin: !!LINKEDIN_CLIENT_ID, facebook: !!FACEBOOK_APP_ID }, push: PUSH_LIVE ? 'on' : 'off', maintenance: CONFIG.maintenance, adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
+app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '2.7.0-hardening', storage: pgReady ? 'postgres' : 'memory', auth_mode: AUTH_MODE, otp: SMS_LIVE ? 'sms' : (OTP_LIVE ? 'whatsapp' : 'demo'), social: { google: !!GOOGLE_CLIENT_ID, linkedin: !!LINKEDIN_CLIENT_ID, facebook: !!FACEBOOK_APP_ID }, push: PUSH_LIVE ? 'on' : 'off', maintenance: CONFIG.maintenance, adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
+
+// ---- Public website forms: contact + newsletter (persist to DB = real, retrievable destination) ----
+const isEmail = (e) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(e || ''))
+app.post('/v1/contact', (req, res) => {
+  const { name = '', email = '', message = '' } = req.body || {}
+  if (!isEmail(email) || !String(message).trim()) return res.status(400).json({ error: 'A valid email and a message are required.' })
+  const row = insert('contacts', { id: uuid(), name: String(name).slice(0, 120), email: String(email).slice(0, 160), message: String(message).slice(0, 4000), created_at: new Date().toISOString(), handled: false })
+  console.log('[contact] new message from', email)
+  res.json({ ok: true, id: row.id })
+})
+app.post('/v1/newsletter', (req, res) => {
+  const { email = '' } = req.body || {}
+  if (!isEmail(email)) return res.status(400).json({ error: 'Enter a valid email address.' })
+  const e = String(email).toLowerCase().slice(0, 160)
+  if (!find('newsletter', (n) => n.email === e)) insert('newsletter', { id: uuid(), email: e, created_at: new Date().toISOString() })
+  res.json({ ok: true })
+})
+app.get('/v1/admin/contacts', requireAdmin, (req, res) => res.json({ ok: true, contacts: filter('contacts', () => true), newsletter: filter('newsletter', () => true) }))
 
 // ---- OTP provider: MSG91 (WhatsApp primary + SMS fallback) with demo fallback ----
 // Set these env vars to go live: MSG91_AUTHKEY and MSG91_OTP_TEMPLATE_ID.
@@ -887,7 +919,34 @@ app.get('/v1/profile/:userId', requireAuth, (req, res) => {
   }
   const fav = !!find('favorites', (f) => f.user_id === req.userId && f.target === owner)
   const tl = trustLevel(u, prof)
-  res.json({ ok: true, profile: { user_id: prof.user_id, display_name: prof.display_name, age: prof.age, city: prof.city, occupation: prof.occupation, interests: prof.interests || [], prompts: prof.prompts || [], kundli: prof.kundli || null, trust_score: u.trust_score, verified: u.verification_status === 'verified', phone_verified: !!u.phone_verified, pledged: !!u.pledge_taken_at, photos: prof.photos || [], video_intro: prof.video_intro || null, trust_level: tl.label, trust_level_n: tl.level, is_new: isNewMember(u), active: activeLabel(u, prof), managed_by: prof.managed_by || 'self', family_relation: prof.family_relation || '', favorited: fav } })
+  // Truthful compatibility vs the viewer (subscores + reasons), if the viewer has a profile.
+  const me = find('profiles', (p) => p.user_id === req.userId)
+  const sp = me ? scorePair(me, prof) : null
+  // Education / height display strings derived from stored fields.
+  const education = [prof.qualification, prof.college].filter(Boolean).join(' · ') || prof.education_field || ''
+  const height = prof.height ? prof.height : (prof.height_cm ? (Math.floor(prof.height_cm / 30.48) + "'" + Math.round((prof.height_cm / 2.54) % 12) + '"') : '')
+  // Real verification state — never hardcoded in the UI; the client renders exactly what's here.
+  const verification = {
+    identity: u.verification_status === 'verified',
+    selfie: u.verification_status === 'verified',
+    phone: !!u.phone_verified,
+    community: tl.level >= 2,
+    status: u.verification_status || 'unverified',
+  }
+  res.json({ ok: true, profile: {
+    user_id: prof.user_id, display_name: prof.display_name, age: prof.age, city: prof.city,
+    occupation: prof.occupation, education, height, religion: prof.religion || '',
+    family_type: prof.family_type || '', family_values: prof.family_values || '', siblings: prof.siblings || '',
+    father_occupation: prof.father_occupation || '', mother_occupation: prof.mother_occupation || '',
+    interests: prof.interests || [], prompts: prof.prompts || [], kundli: prof.kundli || null,
+    trust_score: u.trust_score, verified: u.verification_status === 'verified', phone_verified: !!u.phone_verified,
+    pledged: !!u.pledge_taken_at, verification,
+    member_since: u.created_at || null, verified_on: u.verified_at || null,
+    compatibility_score: sp ? sp.compat : null, reasons: sp ? sp.reasons : [], subscores: sp ? sp.subscores : null,
+    photos: prof.photos || [], video_intro: prof.video_intro || null, trust_level: tl.label, trust_level_n: tl.level,
+    is_new: isNewMember(u), active: activeLabel(u, prof), managed_by: prof.managed_by || 'self',
+    family_relation: prof.family_relation || '', favorited: fav,
+  } })
 })
 
 // MATRIMONY DISCOVERY — strict opposite-gender matching (see CORE MATRIMONY MATCHING RULES).
@@ -937,7 +996,7 @@ app.get('/v1/matches/today', requireAuth, (req, res) => {
     .slice(0, limit).map((c) => {
       const ou = find('users', (x) => x.id === c.o.user_id) || {}
       const tl = trustLevel(ou, c.o)
-      return { user_id: c.o.user_id, name: c.o.display_name, age: c.o.age, city: c.o.city, occupation: c.o.occupation, interests: c.o.interests, compatibility_score: c.compat, reasons: c.reasons, trust_score: ou.trust_score, photo: (c.o.photos && c.o.photos[0]) ? c.o.photos[0].url : null, trust_level: tl.label, trust_level_n: tl.level, is_new: isNewMember(ou), active: activeLabel(ou, c.o), favorited: myFavs.has(c.o.user_id) }
+      return { user_id: c.o.user_id, name: c.o.display_name, age: c.o.age, city: c.o.city, occupation: c.o.occupation, interests: c.o.interests, compatibility_score: c.compat, reasons: c.reasons, subscores: c.subscores, trust_score: ou.trust_score, photo: (c.o.photos && c.o.photos[0]) ? c.o.photos[0].url : null, trust_level: tl.label, trust_level_n: tl.level, is_new: isNewMember(ou), active: activeLabel(ou, c.o), favorited: myFavs.has(c.o.user_id) }
     })
   res.json({ ok: true, date: new Date().toISOString().slice(0, 10), matches })
 })
