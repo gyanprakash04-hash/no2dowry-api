@@ -54,7 +54,7 @@ const SENDERS = {
 console.log(EMAIL_LIVE ? 'Brevo email ENABLED' : 'Brevo email DISABLED (BREVO_API_KEY not set) — emails are logged & skipped.')
 
 /* ---------------- store (in-memory, optionally backed by Postgres) ---------------- */
-const DB = { users: [], profiles: [], otps: [], connections: [], conversations: [], messages: [], videoDates: [], reports: [], subscriptions: [], payments: [], familyInvites: [], bestieInvites: [], blocks: [], modActions: [], notifications: [], pushSubs: [], events: [], errors: [], verifications: [], favorites: [], profileViews: [], settings: [], emails: [], emailSuppress: [], contacts: [], newsletter: [] }
+const DB = { users: [], profiles: [], otps: [], connections: [], conversations: [], messages: [], videoDates: [], reports: [], subscriptions: [], payments: [], familyInvites: [], bestieInvites: [], blocks: [], modActions: [], notifications: [], pushSubs: [], events: [], errors: [], verifications: [], favorites: [], profileViews: [], settings: [], emails: [], emailSuppress: [], contacts: [], newsletter: [], stories: [] }
 const uuid = () => crypto.randomUUID()
 const find = (c, fn) => DB[c].find(fn)
 const filter = (c, fn) => DB[c].filter(fn)
@@ -452,7 +452,7 @@ app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); res.
 
 const inConvo = (c, uid) => c && (c.user_a === uid || c.user_b === uid)
 
-app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '2.7.0-hardening', storage: pgReady ? 'postgres' : 'memory', auth_mode: AUTH_MODE, otp: SMS_LIVE ? 'sms' : (OTP_LIVE ? 'whatsapp' : 'demo'), social: { google: !!GOOGLE_CLIENT_ID, linkedin: !!LINKEDIN_CLIENT_ID, facebook: !!FACEBOOK_APP_ID }, push: PUSH_LIVE ? 'on' : 'off', maintenance: CONFIG.maintenance, adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
+app.get('/v1/health', (req, res) => res.json({ ok: true, service: 'no2dowry-api', version: '2.9.0-trust', storage: pgReady ? 'postgres' : 'memory', auth_mode: AUTH_MODE, otp: SMS_LIVE ? 'sms' : (OTP_LIVE ? 'whatsapp' : 'demo'), social: { google: !!GOOGLE_CLIENT_ID, linkedin: !!LINKEDIN_CLIENT_ID, facebook: !!FACEBOOK_APP_ID }, push: PUSH_LIVE ? 'on' : 'off', maintenance: CONFIG.maintenance, adminLocked: !!ADMIN_TOKEN, time: new Date().toISOString() }))
 
 // ---- Public website forms: contact + newsletter (persist to DB = real, retrievable destination) ----
 const isEmail = (e) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(e || ''))
@@ -512,7 +512,7 @@ const CONFIG_DEFAULTS = {
   auth_mode: '',            // '' = use ENV_AUTH_MODE; else override (otp_disabled|otp_demo|otp_production)
   providers: { google: true, linkedin: true, facebook: true }, // ANDed with whether env has the credential
   features: { shortlist: true, video_intro: true, family_managed: true, deal_breakers: true, new_member_boost: true, profile_views: true, completion_nudges: true, push: true, slow_mode: true },
-  daily_match_count: 4,
+  daily_match_count: 4, premium_match_count: 10,
   require_photo: false,     // members must add a photo before they can browse matches
   require_pledge: false,    // members must take the pledge before they can browse matches
   auto_verify: false,       // selfies are auto-approved (use only when no human reviewer is available)
@@ -628,7 +628,7 @@ app.post('/v1/auth/verify', rateLimit(10, 60000), async (req, res) => {
   const norm = toMobile(phone)
   let user = find('users', (u) => toMobile(u.phone) === norm)
   if (!user && CONFIG.maintenance) return res.status(503).json({ error: CONFIG.maintenance_message || 'New sign-ups are paused right now. Please check back soon.' })
-  if (!user) user = insert('users', { id: uuid(), phone, created_at: new Date().toISOString(), pledge_taken_at: null, verification_status: 'unverified', phone_verified: verified, phone_verified_at: verified ? new Date().toISOString() : null, google_connected: false, linkedin_connected: false, facebook_connected: false, social_ids: {}, trust_score: 42, is_premium: false, status: 'active', slow_mode: false })
+  if (!user) user = insert('users', { id: uuid(), phone, created_at: new Date().toISOString(), pledge_taken_at: null, verification_status: 'unverified', phone_verified: verified, phone_verified_at: verified ? new Date().toISOString() : null, google_connected: false, linkedin_connected: false, facebook_connected: false, social_ids: {}, id_verified: false, trust_score: 42, is_premium: false, status: 'active', slow_mode: false })
   else if (verified && !user.phone_verified) update('users', user.id, { phone_verified: true, phone_verified_at: new Date().toISOString() })
   res.json({ ok: true, token: issueToken(user.id), user: find('users', (u) => u.id === user.id) })
 })
@@ -704,7 +704,7 @@ app.post('/v1/auth/social', optionalAuth, rateLimit(20, 60000), async (req, res)
   let created = false
   if (!user && CONFIG.maintenance) return res.status(503).json({ error: CONFIG.maintenance_message || 'New sign-ups are paused right now. Please check back soon.' })
   if (!user) {
-    user = insert('users', { id: uuid(), phone: null, email: identity.email || null, created_at: new Date().toISOString(), pledge_taken_at: null, verification_status: 'unverified', phone_verified: false, google_connected: false, linkedin_connected: false, facebook_connected: false, social_ids: {}, trust_score: 42, is_premium: false, status: 'active', slow_mode: false })
+    user = insert('users', { id: uuid(), phone: null, email: identity.email || null, created_at: new Date().toISOString(), pledge_taken_at: null, verification_status: 'unverified', phone_verified: false, google_connected: false, linkedin_connected: false, facebook_connected: false, social_ids: {}, id_verified: false, trust_score: 42, is_premium: false, status: 'active', slow_mode: false })
     if (identity.name) insert('profiles', { id: uuid(), user_id: user.id, display_name: identity.name })
     created = true
   }
@@ -813,7 +813,7 @@ app.get('/v1/favorites', requireAuth, (req, res) => {
       const p = find('profiles', (x) => x.user_id === f.target)
       const tu = find('users', (x) => x.id === f.target) || {}
       const mutual = !!find('favorites', (x) => x.user_id === f.target && x.target === req.userId)
-      return { user_id: f.target, name: p ? p.display_name : 'Member', age: p ? p.age : null, city: p ? p.city : '', occupation: p ? p.occupation : '', photo: (p && p.photos && p.photos[0]) ? p.photos[0].url : null, trust_score: tu.trust_score, mutual, since: f.created_at }
+      return { user_id: f.target, name: p ? p.display_name : 'Member', age: p ? p.age : null, city: p ? p.city : '', occupation: p ? p.occupation : '', photo: pubPrimary(p), trust_score: tu.trust_score, mutual, since: f.created_at }
     })
   res.json({ ok: true, favorites: list })
 })
@@ -850,7 +850,7 @@ app.get('/v1/profile-views', requireAuth, (req, res) => {
     seen.add(v.viewer)
     const p = find('profiles', (x) => x.user_id === v.viewer)
     const vu = find('users', (x) => x.id === v.viewer) || {}
-    viewers.push({ user_id: v.viewer, name: p ? p.display_name : 'Member', age: p ? p.age : null, city: p ? p.city : '', occupation: p ? p.occupation : '', photo: (p && p.photos && p.photos[0]) ? p.photos[0].url : null, trust_score: vu.trust_score, when: v.created_at })
+    viewers.push({ user_id: v.viewer, name: p ? p.display_name : 'Member', age: p ? p.age : null, city: p ? p.city : '', occupation: p ? p.occupation : '', photo: pubPrimary(p), trust_score: vu.trust_score, when: v.created_at })
   }
   res.json({ ok: true, viewers, anonymous, total: views.length })
 })
@@ -868,20 +868,139 @@ app.put('/v1/profile', requireAuth, (req, res) => {
   else insert('profiles', p)
   res.json({ ok: true, profile: p })
 })
+/* ---------------- photo moderation (Sprint #2) ----------------
+   Legacy photos with NO moderation_state are treated as approved (never hide existing members).
+   New uploads start in pending_review and are hidden from all public surfaces until approved. */
+function photoApproved(ph) { return !!ph && (!ph.moderation_state || ph.moderation_state === 'approved') }
+function pubPhotos(prof) { return ((prof && prof.photos) || []).filter(photoApproved) }
+function pubPrimary(prof) { const a = pubPhotos(prof); return (a[0] && a[0].url) || null }
+// Phase 3 plug-in point: classify a freshly-uploaded photo. Default = human review.
+function moderatePhotoInitial(/* url */) { return 'pending_review' }
+
 // Profile photos: ordered list, photos[0] = primary. Up to 7. URLs must be from our Cloudinary.
 app.put('/v1/profile/photos', requireAuth, (req, res) => {
   const { photos } = req.body || {}
   if (!Array.isArray(photos)) return res.status(400).json({ error: 'photos array required' })
+  let p = find('profiles', (x) => x.user_id === req.userId)
+  if (!p) return res.status(400).json({ error: 'Build your profile first.' })
+  const prevByUrl = {}; (p.photos || []).forEach((e) => { prevByUrl[e.url] = e })
   const clean = photos
     .filter((ph) => ph && typeof ph.url === 'string' && /^https:\/\/res\.cloudinary\.com\//.test(ph.url))
     .slice(0, 7)
-    .map((ph) => ({ url: ph.url, public_id: typeof ph.public_id === 'string' ? ph.public_id.slice(0, 200) : null }))
-  let p = find('profiles', (x) => x.user_id === req.userId)
-  if (!p) return res.status(400).json({ error: 'Build your profile first.' })
+    .map((ph) => {
+      const prev = prevByUrl[ph.url]
+      const base = { url: ph.url, public_id: typeof ph.public_id === 'string' ? ph.public_id.slice(0, 200) : (prev ? prev.public_id : null) }
+      // SECURITY: never trust a client-sent moderation_state. Keep an existing photo's
+      // server state (legacy/no-state = approved); a brand-new upload starts in review.
+      if (prev) { if (prev.moderation_state) base.moderation_state = prev.moderation_state; if (prev.reported) { base.reported = true; base.report_count = prev.report_count || 0 } }
+      else { base.moderation_state = moderatePhotoInitial(ph.url) }
+      return base
+    })
   p.photos = clean
   p.completeness = computeCompleteness(p)
   update('profiles', p.id, p)
   res.json({ ok: true, photos: clean, completeness: p.completeness })
+})
+
+// Report a photo (any member). Flags for admin review; does not auto-hide on a single report.
+app.post('/v1/photos/report', requireAuth, (req, res) => {
+  const { target_user, url, reason } = req.body || {}
+  if (!target_user || !url) return res.status(400).json({ error: 'target_user and url required' })
+  const tp = find('profiles', (x) => x.user_id === target_user)
+  if (tp && Array.isArray(tp.photos)) {
+    const ph = tp.photos.find((x) => x.url === url)
+    if (ph) { ph.reported = true; ph.report_count = (ph.report_count || 0) + 1; update('profiles', tp.id, tp) }
+  }
+  insert('reports', { id: uuid(), type: 'photo', from_user: req.userId, target: target_user, photo_url: url, reason: String(reason || '').slice(0, 300), status: 'open', created_at: new Date().toISOString() })
+  res.json({ ok: true })
+})
+// Admin photo-moderation queue: everything pending_review, rejected, or reported.
+app.get('/v1/admin/photos', requireAdmin, (req, res) => {
+  const items = []
+  for (const p of DB.profiles) {
+    const u = find('users', (x) => x.id === p.user_id)
+    for (const ph of (p.photos || [])) {
+      const st = ph.moderation_state || 'approved'
+      if (st === 'pending_review' || st === 'rejected' || ph.reported) {
+        items.push({ user_id: p.user_id, name: p.display_name || (u && u.phone) || 'Member', url: ph.url, public_id: ph.public_id || null, moderation_state: st, reported: !!ph.reported, report_count: ph.report_count || 0 })
+      }
+    }
+  }
+  res.json({ ok: true, photos: items, pending: items.filter((x) => x.moderation_state === 'pending_review').length, reported: items.filter((x) => x.reported).length })
+})
+function setPhotoState(user_id, url, state) {
+  const p = find('profiles', (x) => x.user_id === user_id); if (!p || !Array.isArray(p.photos)) return false
+  const ph = p.photos.find((x) => x.url === url); if (!ph) return false
+  ph.moderation_state = state; ph.reported = false; ph.report_count = 0
+  update('profiles', p.id, p)
+  filter('reports', (r) => r.type === 'photo' && r.photo_url === url && r.status === 'open').forEach((r) => update('reports', r.id, { status: 'resolved', resolved_at: new Date().toISOString() }))
+  return true
+}
+app.post('/v1/admin/photos/approve', requireAdmin, (req, res) => {
+  const { user_id, url } = req.body || {}
+  if (!setPhotoState(user_id, url, 'approved')) return res.status(404).json({ error: 'Photo not found' })
+  res.json({ ok: true })
+})
+app.post('/v1/admin/photos/reject', requireAdmin, (req, res) => {
+  const { user_id, url } = req.body || {}
+  if (!setPhotoState(user_id, url, 'rejected')) return res.status(404).json({ error: 'Photo not found' })
+  res.json({ ok: true })
+})
+
+/* ---------------- Success stories (real, consented, admin-moderated) ----------------
+   No fabricated couples. Members submit; admin approves; only approved stories are public. */
+const cleanCloudinary = (u) => (typeof u === 'string' && /^https:\/\/res\.cloudinary\.com\//.test(u)) ? u : null
+const pubStory = (s) => ({ id: s.id, title: s.title, text: s.text, wedding_date: s.wedding_date || null, city: s.city || '', photo: s.photo || null, featured: !!s.featured, created_at: s.created_at })
+// Submit a story (goes to moderation).
+app.post('/v1/stories', requireAuth, rateLimit(5, 864e5), (req, res) => {
+  const b = req.body || {}
+  const title = String(b.title || '').trim().slice(0, 120)
+  const text = String(b.text || '').trim().slice(0, 1500)
+  if (!title || !text) return res.status(400).json({ error: 'Title and story text are required.' })
+  const row = insert('stories', {
+    id: uuid(), user_id: req.userId, title, text,
+    wedding_date: String(b.wedding_date || '').slice(0, 20) || null,
+    city: String(b.city || '').trim().slice(0, 60),
+    photo: cleanCloudinary(b.photo_url), status: 'pending_review', featured: false,
+    created_at: new Date().toISOString(),
+  })
+  res.json({ ok: true, story: { id: row.id, status: row.status }, note: 'Thank you! Your story is in review and will appear once approved.' })
+})
+// Public list: approved only, featured first, newest first.
+app.get('/v1/stories', (req, res) => {
+  const list = filter('stories', (s) => s.status === 'approved')
+    .sort((a, b) => (b.featured - a.featured) || (b.created_at || '').localeCompare(a.created_at || ''))
+    .map(pubStory)
+  res.json({ ok: true, stories: list })
+})
+// My stories (any status) so the client can celebrate when one is approved.
+app.get('/v1/stories/mine', requireAuth, (req, res) => {
+  const mine = filter('stories', (s) => s.user_id === req.userId)
+    .sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
+    .map((s) => ({ id: s.id, title: s.title, status: s.status, featured: !!s.featured, created_at: s.created_at }))
+  res.json({ ok: true, stories: mine })
+})
+// Admin moderation
+app.get('/v1/admin/stories', requireAdmin, (req, res) => {
+  const list = [...DB.stories].sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
+    .map((s) => ({ ...pubStory(s), user_id: s.user_id, status: s.status }))
+  res.json({ ok: true, stories: list, pending: filter('stories', (s) => s.status === 'pending_review').length })
+})
+app.post('/v1/admin/stories/:id/approve', requireAdmin, (req, res) => {
+  const s = find('stories', (x) => x.id === req.params.id); if (!s) return res.status(404).json({ error: 'Not found' })
+  update('stories', s.id, { status: 'approved', reviewed_at: new Date().toISOString() })
+  notify(s.user_id, { type: 'general', title: '🎊 Your success story is live!', body: 'Thank you for sharing — your story now inspires others on No2Dowry.', data: { story_id: s.id } })
+  res.json({ ok: true })
+})
+app.post('/v1/admin/stories/:id/reject', requireAdmin, (req, res) => {
+  const s = find('stories', (x) => x.id === req.params.id); if (!s) return res.status(404).json({ error: 'Not found' })
+  update('stories', s.id, { status: 'rejected', reviewed_at: new Date().toISOString(), note: String((req.body && req.body.note) || '').slice(0, 300) })
+  res.json({ ok: true })
+})
+app.post('/v1/admin/stories/:id/feature', requireAdmin, (req, res) => {
+  const s = find('stories', (x) => x.id === req.params.id); if (!s) return res.status(404).json({ error: 'Not found' })
+  update('stories', s.id, { featured: !s.featured })
+  res.json({ ok: true, featured: !s.featured })
 })
 // Profile video intro: a short clip hosted on Cloudinary. Pass url:null to remove it.
 app.put('/v1/profile/video', requireAuth, (req, res) => {
@@ -899,6 +1018,15 @@ app.put('/v1/profile/video', requireAuth, (req, res) => {
   update('profiles', p.id, p)
   res.json({ ok: true, video_intro: p.video_intro || null, completeness: p.completeness })
 })
+// Truthful verification tiers — show only what is actually true. (No "Identity" over-claim.)
+function verifTier(u) {
+  if (!u) return 'none'
+  if (u.id_verified) return 'id'                           // government-ID / KYC reviewed (new flag; default false)
+  if (u.verification_status === 'verified') return 'photo'  // a real selfie/photo was reviewed
+  if (u.phone_verified) return 'phone'                      // OTP
+  return 'none'
+}
+const VERIF_LABEL = { id: 'ID Verified', photo: 'Photo Verified', phone: 'Phone Verified', none: '' }
 app.get('/v1/profile/:userId', requireAuth, (req, res) => {
   const prof = find('profiles', (p) => p.user_id === req.params.userId)
   if (!prof) return res.status(404).json({ error: 'Profile not found' })
@@ -918,6 +1046,9 @@ app.get('/v1/profile/:userId', requireAuth, (req, res) => {
     }
   }
   const fav = !!find('favorites', (f) => f.user_id === req.userId && f.target === owner)
+  // P1: connection status between the viewer and this profile — gates the Video Introduction CTA.
+  const connRow = find('connections', (x) => (x.from_user === req.userId && x.to_user === owner) || (x.from_user === owner && x.to_user === req.userId))
+  const connection_status = !connRow ? 'none' : (connRow.status === 'accepted' ? 'accepted' : (connRow.from_user === req.userId ? 'pending' : 'incoming'))
   const tl = trustLevel(u, prof)
   // Truthful compatibility vs the viewer (subscores + reasons), if the viewer has a profile.
   const me = find('profiles', (p) => p.user_id === req.userId)
@@ -925,12 +1056,14 @@ app.get('/v1/profile/:userId', requireAuth, (req, res) => {
   // Education / height display strings derived from stored fields.
   const education = [prof.qualification, prof.college].filter(Boolean).join(' · ') || prof.education_field || ''
   const height = prof.height ? prof.height : (prof.height_cm ? (Math.floor(prof.height_cm / 30.48) + "'" + Math.round((prof.height_cm / 2.54) % 12) + '"') : '')
-  // Real verification state — never hardcoded in the UI; the client renders exactly what's here.
+  // Real verification state — truthful tiers; the client renders exactly what's here.
+  const tier = verifTier(u)
   const verification = {
-    identity: u.verification_status === 'verified',
-    selfie: u.verification_status === 'verified',
+    id: tier === 'id',
+    photo: tier === 'id' || tier === 'photo',
     phone: !!u.phone_verified,
     community: tl.level >= 2,
+    tier, label: VERIF_LABEL[tier],
     status: u.verification_status || 'unverified',
   }
   res.json({ ok: true, profile: {
@@ -939,13 +1072,14 @@ app.get('/v1/profile/:userId', requireAuth, (req, res) => {
     family_type: prof.family_type || '', family_values: prof.family_values || '', siblings: prof.siblings || '',
     father_occupation: prof.father_occupation || '', mother_occupation: prof.mother_occupation || '',
     interests: prof.interests || [], prompts: prof.prompts || [], kundli: prof.kundli || null,
-    trust_score: u.trust_score, verified: u.verification_status === 'verified', phone_verified: !!u.phone_verified,
+    trust_score: u.trust_score, verified: tier === 'id' || tier === 'photo', verification_tier: tier, phone_verified: !!u.phone_verified,
     pledged: !!u.pledge_taken_at, verification,
     member_since: u.created_at || null, verified_on: u.verified_at || null,
     compatibility_score: sp ? sp.compat : null, reasons: sp ? sp.reasons : [], subscores: sp ? sp.subscores : null,
-    photos: prof.photos || [], video_intro: prof.video_intro || null, trust_level: tl.label, trust_level_n: tl.level,
+    photos: pubPhotos(prof), video_intro: prof.video_intro || null, trust_level: tl.label, trust_level_n: tl.level,
     is_new: isNewMember(u), active: activeLabel(u, prof), managed_by: prof.managed_by || 'self',
     family_relation: prof.family_relation || '', favorited: fav,
+    connection_status, connected: connection_status === 'accepted',
   } })
 })
 
@@ -958,7 +1092,11 @@ app.get('/v1/matches/today', requireAuth, (req, res) => {
   // Admin-controlled gates: members may need a photo / the pledge before they can browse.
   if (CONFIG.require_photo && !(me.photos && me.photos.length)) return res.json({ ok: true, date: new Date().toISOString().slice(0, 10), matches: [], needs_photo: true, message: 'Add a profile photo to start seeing matches.' })
   if (CONFIG.require_pledge && !(u && u.pledge_taken_at)) return res.json({ ok: true, date: new Date().toISOString().slice(0, 10), matches: [], needs_pledge: true, message: 'Take the dowry-free pledge to start seeing matches.' })
-  const limit = (u && u.slow_mode && CONFIG.features.slow_mode) ? 2 : CONFIG.daily_match_count
+  // Premium gets more curated matches/day; free keeps the honest base count.
+  const baseLimit = (u && u.slow_mode && CONFIG.features.slow_mode) ? 2 : CONFIG.daily_match_count
+  const premiumLimit = Math.max(baseLimit, CONFIG.premium_match_count || 10)
+  const isPrem = !!(u && u.is_premium)
+  const limit = isPrem ? premiumLimit : baseLimit
   // RULE 1 + RULE 5: target gender is the opposite of the viewer's gender (future: read a preference).
   const target = oppositeGender(me.gender)
   if (!target) return res.json({ ok: true, date: new Date().toISOString().slice(0, 10), matches: [], needs_gender: true, message: 'Add your gender to your profile to see matches.' })
@@ -979,6 +1117,7 @@ app.get('/v1/matches/today', requireAuth, (req, res) => {
     let r = 0
     if (computeCompleteness(o) >= 80) r += 1000
     if (ou.verification_status === 'verified') r += 300
+    if (ou.is_premium) r += 500 // Premium: priority visibility (reorders within the eligible set; never hides anyone)
     if (o.photos && o.photos.length) r += 200
     if (o.video_intro) r += 150
     if (ou.pledge_taken_at) r += 150
@@ -996,10 +1135,31 @@ app.get('/v1/matches/today', requireAuth, (req, res) => {
     .slice(0, limit).map((c) => {
       const ou = find('users', (x) => x.id === c.o.user_id) || {}
       const tl = trustLevel(ou, c.o)
-      return { user_id: c.o.user_id, name: c.o.display_name, age: c.o.age, city: c.o.city, occupation: c.o.occupation, interests: c.o.interests, compatibility_score: c.compat, reasons: c.reasons, subscores: c.subscores, trust_score: ou.trust_score, photo: (c.o.photos && c.o.photos[0]) ? c.o.photos[0].url : null, trust_level: tl.label, trust_level_n: tl.level, is_new: isNewMember(ou), active: activeLabel(ou, c.o), favorited: myFavs.has(c.o.user_id) }
+      return { user_id: c.o.user_id, name: c.o.display_name, age: c.o.age, city: c.o.city, occupation: c.o.occupation, interests: c.o.interests, compatibility_score: c.compat, reasons: c.reasons, subscores: c.subscores, trust_score: ou.trust_score, photo: pubPrimary(c.o), trust_level: tl.label, trust_level_n: tl.level, verified: ou.verification_status === 'verified', verification_tier: verifTier(ou), is_new: isNewMember(ou), active: activeLabel(ou, c.o), favorited: myFavs.has(c.o.user_id) }
     })
-  res.json({ ok: true, date: new Date().toISOString().slice(0, 10), matches })
+  // Honest upsell signal: how many more curated matches a Premium member would see today.
+  const more_with_premium = isPrem ? 0 : Math.max(0, Math.min(eligible.length, premiumLimit) - baseLimit)
+  res.json({ ok: true, date: new Date().toISOString().slice(0, 10), matches, more_with_premium, premium: isPrem })
 })
+
+// Who liked you (favorited you). True count is always returned; the list is Premium-only.
+app.get('/v1/liked-me', requireAuth, (req, res) => {
+  const u = find('users', (x) => x.id === req.userId)
+  const likers = filter('favorites', (f) => f.target === req.userId).sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
+  const count = likers.length
+  if (!(u && u.is_premium)) return res.json({ ok: true, count, locked: true, users: [] })
+  const users = likers.map((f) => {
+    const p = find('profiles', (x) => x.user_id === f.user_id); const lu = find('users', (x) => x.id === f.user_id) || {}
+    const mutual = !!find('favorites', (x) => x.user_id === req.userId && x.target === f.user_id)
+    return { user_id: f.user_id, name: p ? p.display_name : 'Member', age: p ? p.age : null, city: p ? p.city : '', occupation: p ? p.occupation : '', photo: pubPrimary(p), trust_score: lu.trust_score, mutual, when: f.created_at }
+  })
+  res.json({ ok: true, count, locked: false, users })
+})
+
+// DEV-ONLY (ALLOW_DEV_AUTH): grant premium to the caller for local testing. Refused in production.
+if (ALLOW_DEV_AUTH) {
+  app.post('/v1/dev/grant-premium', requireAuth, (req, res) => { applyPremium(req.userId, 'premium'); res.json({ ok: true, is_premium: true }) })
+}
 
 app.post('/v1/connections', requireAuth, rateLimit(30, 60000), (req, res) => {
   const { to_user, opener_message } = req.body || {}
@@ -1101,10 +1261,19 @@ app.post('/v1/video-dates', requireAuth, (req, res) => {
 // List my video dates (as requester or recipient), with counterparty name + status.
 app.get('/v1/video-dates', requireAuth, (req, res) => {
   const uid = req.userId
-  const nameOf = (id) => { const p = find('profiles', (x) => x.user_id === id); return (p && p.display_name) || 'Member' }
+  // P1 state-machine completion: an approved call whose time has passed becomes 'completed'.
+  const nowMs = Date.now()
+  filter('videoDates', (v) => v.status === 'approved' && v.proposed_time && new Date(v.proposed_time).getTime() < nowMs)
+    .forEach((v) => update('videoDates', v.id, { status: 'completed', completed_at: new Date().toISOString() }))
+  const profOf = (id) => find('profiles', (x) => x.user_id === id)
+  const nameOf = (id) => { const p = profOf(id); return (p && p.display_name) || 'Member' }
+  const photoOf = (id) => pubPrimary(profOf(id))
   const mine = filter('videoDates', (v) => v.requester === uid || v.recipient === uid)
     .sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
-    .map((v) => ({ id: v.id, status: v.status, proposed_time: v.proposed_time, room_id: v.room_id, created_at: v.created_at, role: v.requester === uid ? 'requester' : 'recipient', with_name: nameOf(v.requester === uid ? v.recipient : v.requester) }))
+    .map((v) => {
+      const other = v.requester === uid ? v.recipient : v.requester
+      return { id: v.id, status: v.status, proposed_time: v.proposed_time, room_id: v.room_id, created_at: v.created_at, role: v.requester === uid ? 'requester' : 'recipient', with_user: other, with_name: nameOf(other), with_photo: photoOf(other) }
+    })
   res.json({ ok: true, videoDates: mine })
 })
 app.post('/v1/video-dates/:id/approve', requireAuth, (req, res) => {
@@ -1123,6 +1292,35 @@ app.post('/v1/video-dates/:id/cancel', requireAuth, (req, res) => {
   if (vd.requester !== req.userId && vd.recipient !== req.userId) return res.status(403).json({ error: 'Not your meeting.' })
   if (vd.status !== 'cancelled') update('videoDates', vd.id, { status: 'cancelled' })
   res.json({ ok: true, videoDate: find('videoDates', (v) => v.id === req.params.id) })
+})
+// Explicit completion (e.g. "mark call done"). Auto-completion also happens on list (approved + past).
+app.post('/v1/video-dates/:id/complete', requireAuth, (req, res) => {
+  const vd = find('videoDates', (v) => v.id === req.params.id)
+  if (!vd) return res.status(404).json({ error: 'Not found' })
+  if (vd.requester !== req.userId && vd.recipient !== req.userId) return res.status(403).json({ error: 'Not your meeting.' })
+  if (vd.status === 'approved' || vd.status === 'completed') update('videoDates', vd.id, { status: 'completed', completed_at: vd.completed_at || new Date().toISOString() })
+  res.json({ ok: true, videoDate: find('videoDates', (v) => v.id === req.params.id) })
+})
+
+// P1: member journey milestones — derived from real data, so they auto-update after
+// each event (connection accepted, video requested/accepted/completed). No separate store.
+app.get('/v1/milestones', requireAuth, (req, res) => {
+  const uid = req.userId
+  const u = find('users', (x) => x.id === uid) || {}
+  const prof = find('profiles', (p) => p.user_id === uid)
+  const myConns = filter('connections', (c) => c.from_user === uid || c.to_user === uid)
+  const myVDs = filter('videoDates', (v) => v.requester === uid || v.recipient === uid)
+  const has = (arr, f) => arr.some(f)
+  const milestones = [
+    { key: 'profile', label: 'Profile created', icon: '📝', done: !!prof },
+    { key: 'pledge', label: 'Dowry-free pledge taken', icon: '🏅', done: !!u.pledge_taken_at },
+    { key: 'verified', label: 'Profile verified', icon: '✅', done: u.verification_status === 'verified' },
+    { key: 'connection', label: 'First connection accepted', icon: '💛', done: has(myConns, (c) => c.status === 'accepted') },
+    { key: 'video_request', label: 'First video date requested', icon: '🎥', done: has(myVDs, (v) => v.requester === uid) },
+    { key: 'video_accepted', label: 'First video date confirmed', icon: '📅', done: has(myVDs, (v) => v.status === 'approved' || v.status === 'completed') },
+    { key: 'video_completed', label: 'First video call completed', icon: '🎉', done: has(myVDs, (v) => v.status === 'completed') },
+  ]
+  res.json({ ok: true, milestones, completed: milestones.filter((m) => m.done).length, total: milestones.length })
 })
 
 app.post('/v1/family-circle', requireAuth, (req, res) => {
