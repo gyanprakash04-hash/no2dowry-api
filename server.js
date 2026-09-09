@@ -743,6 +743,33 @@ app.post('/v1/verification/selfie', requireAuth, rateLimit(5, 3600000), (req, re
   update('users', u.id, { verification_status: 'pending' })
   res.json({ ok: true, status: 'pending', verification: { id: row.id, status: 'pending' } })
 })
+// Submit a government ID document for human review. Grants the 'id' tier only on admin approval.
+app.post('/v1/verification/id-document', requireAuth, rateLimit(5, 3600000), (req, res) => {
+  const DOC_TYPES = ['aadhaar_masked', 'passport', 'driving_licence', 'voter_id']
+  const { image, doc_type } = req.body || {}
+  if (!DOC_TYPES.includes(doc_type)) return res.status(400).json({ error: 'Invalid document type.' })
+  if (!image || !/^data:image\/(jpeg|jpg|png|webp);base64,/.test(image)) return res.status(400).json({ error: 'A clear photo of your ID is required.' })
+  if (image.length > 1000000) return res.status(413).json({ error: 'Image too large — please retake.' })
+  const u = find('users', (x) => x.id === req.userId)
+  if (!u) return res.status(404).json({ error: 'User not found' })
+  if (u.id_verified) return res.json({ ok: true, status: 'already_verified' })
+  filter('verifications', (v) => v.user_id === req.userId && v.type === 'id' && v.status === 'pending')
+    .forEach((p) => {
+      DB.verifications = DB.verifications.filter((x) => x.id !== p.id)
+      if (pgReady) pool.query('DELETE FROM kv WHERE collection=$1 AND id=$2', ['verifications', String(p.id)]).catch(() => {})
+    })
+  const row = insert('verifications', {
+    id: uuid(),
+    user_id: req.userId,
+    type: 'id',
+    doc_type,
+    status: 'pending',
+    document: image,
+    created_at: new Date().toISOString()
+  })
+  update('users', u.id, { id_review_status: 'pending' })
+  res.json({ ok: true, status: 'pending', verification: { id: row.id, status: 'pending' } })
+})
 app.get('/v1/verification/status', requireAuth, (req, res) => {
   const u = find('users', (x) => x.id === req.userId)
   res.json({ ok: true, phone_verified: !!u.phone_verified, verification_status: u.verification_status || 'unverified', verified: u.verification_status === 'verified' })
@@ -1334,7 +1361,11 @@ app.post('/v1/bestie', requireAuth, (req, res) => {
   res.json({ ok: true, invite: insert('bestieInvites', { id: uuid(), user_id: req.userId, contact, status: 'invited', created_at: new Date().toISOString() }) })
 })
 
-const PLANS = { premium: { name: 'No2Dowry Premium', price_inr: 499, days: 30 }, elite: { name: 'Verified+ Elite', price_inr: 1499, days: 30 } }
+const PLANS = {
+  silver: { name: 'Silver Concierge', price_inr: 2999, days: 90 },
+  gold:   { name: 'Gold Concierge',   price_inr: 4999, days: 180 },
+  royal:  { name: 'Royal Concierge',  price_inr: 7999, days: 365 },
+}
 
 app.get('/v1/billing/plans', requireAuth, (req, res) => res.json({ ok: true, plans: PLANS, razorpay_enabled: RAZORPAY_LIVE, key_id: RAZORPAY_LIVE ? RAZORPAY_KEY_ID : null }))
 
@@ -1387,7 +1418,7 @@ app.post('/v1/billing/order', requireAuth, rateLimit(10, 60000), async (req, res
     const amount = PLANS[plan].price_inr * 100 // paise
     const order = await razorpayApi('/orders', 'POST', { amount, currency: 'INR', receipt: ('n2d_' + req.userId + '_' + Date.now()).slice(0, 40), notes: { user_id: req.userId, plan } })
     insert('payments', { id: uuid(), user_id: req.userId, plan, order_id: order.id, payment_id: null, amount, currency: 'INR', status: 'created', source: 'order', created_at: new Date().toISOString() })
-    res.json({ ok: true, order_id: order.id, amount, currency: 'INR', key_id: RAZORPAY_KEY_ID, plan, name: PLANS[plan].name, description: PLANS[plan].name + ' — 30 days', prefill: { contact: (u && u.phone) || '', email: (u && u.email) || '' } })
+    res.json({ ok: true, order_id: order.id, amount, currency: 'INR', key_id: RAZORPAY_KEY_ID, plan, name: PLANS[plan].name, description: PLANS[plan].name + ' — ' + PLANS[plan].days + ' days', prefill: { contact: (u && u.phone) || '', email: (u && u.email) || '' } })
   } catch (e) { console.error('[billing] order error:', e.message); res.status(502).json({ error: 'Could not start payment. Please try again.' }) }
 })
 
@@ -1654,28 +1685,75 @@ app.post('/v1/admin/users/:id/delete', requireAdmin, (req, res) => {
 app.get('/v1/admin/verifications', requireAdmin, (req, res) => {
   const pending = filter('verifications', (v) => v.status === 'pending')
     .sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''))
-    .map((v) => ({ id: v.id, user_id: v.user_id, name: nameOf(v.user_id), selfie: v.selfie, created_at: v.created_at }))
+    .map((v) => ({
+      id: v.id,
+      user_id: v.user_id,
+      name: nameOf(v.user_id),
+      type: v.type || 'selfie',
+      doc_type: v.doc_type || null,
+      selfie: v.selfie || null,
+      document: v.document || null,
+      created_at: v.created_at
+    }))
   res.json({ ok: true, verifications: pending })
 })
 app.post('/v1/admin/verifications/:id/approve', requireAdmin, (req, res) => {
   const v = find('verifications', (x) => x.id === req.params.id)
   if (!v) return res.status(404).json({ error: 'Verification not found' })
   const u = find('users', (x) => x.id === v.user_id)
-  if (u) { update('users', u.id, { verification_status: 'verified', verified_at: new Date().toISOString(), trust_score: Math.min(100, (u.trust_score || 42) + 20) }); emailUser(u.id, 'verification_approved', {}) }
-  // approved: keep status, DISCARD the selfie image (don't retain biometrics)
-  update('verifications', v.id, { status: 'approved', selfie: null, reviewed_at: new Date().toISOString() })
+  if (u) {
+    const isId = v.type === 'id'
+    const patch = {
+      verification_status: 'verified',
+      verified_at: u.verified_at || new Date().toISOString(),
+      trust_score: Math.min(100, (u.trust_score || 42) + 20)
+    }
+    if (isId) {
+      patch.id_verified = true
+      patch.id_review_status = 'approved'
+    }
+    update('users', u.id, patch)
+    emailUser(u.id, 'verification_approved', {})
+  }
+  update('verifications', v.id, {
+    status: 'approved',
+    selfie: null,
+    document: null,
+    reviewed_at: new Date().toISOString()
+  })
   insert('modActions', { id: uuid(), kind: 'verify_approve', user_id: v.user_id, at: new Date().toISOString() })
-  if (u) notify(u.id, { type: 'verification', title: '✅ You are verified!', body: 'Your identity check passed. Your profile now shows the Verified badge.', data: {} })
+  if (u) notify(u.id, {
+    type: 'verification',
+    title: '✅ You are verified!',
+    body: v.type === 'id' ? 'Your Govt ID check passed. Your profile now shows the ID Verified badge.' : 'Your identity check passed. Your profile now shows the Verified badge.',
+    data: {}
+  })
   res.json({ ok: true, status: 'approved' })
 })
 app.post('/v1/admin/verifications/:id/reject', requireAdmin, (req, res) => {
   const v = find('verifications', (x) => x.id === req.params.id)
   if (!v) return res.status(404).json({ error: 'Verification not found' })
   const u = find('users', (x) => x.id === v.user_id)
-  if (u) update('users', u.id, { verification_status: 'rejected' })
-  update('verifications', v.id, { status: 'rejected', selfie: null, reviewed_at: new Date().toISOString(), note: (req.body && req.body.note) || '' })
+  if (u) {
+    const patch = v.type === 'id'
+      ? { id_review_status: 'rejected' }
+      : { verification_status: 'rejected' }
+    update('users', u.id, patch)
+  }
+  update('verifications', v.id, {
+    status: 'rejected',
+    selfie: null,
+    document: null,
+    reviewed_at: new Date().toISOString(),
+    note: (req.body && req.body.note) || ''
+  })
   insert('modActions', { id: uuid(), kind: 'verify_reject', user_id: v.user_id, at: new Date().toISOString() })
-  if (u) notify(u.id, { type: 'verification', title: 'Verification needs another try', body: 'Your selfie could not be verified. Please re-submit a clear, well-lit photo of your face.', data: {} })
+  if (u) notify(u.id, {
+    type: 'verification',
+    title: 'Verification needs another try',
+    body: v.type === 'id' ? 'Your ID document could not be verified. Please re-submit a clear, valid document.' : 'Your selfie could not be verified. Please re-submit a clear, well-lit photo of your face.',
+    data: {}
+  })
   res.json({ ok: true, status: 'rejected' })
 })
 
