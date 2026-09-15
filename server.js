@@ -558,7 +558,17 @@ const genCode = () => String(Math.floor(100000 + Math.random() * 900000))
 const toMobile = (p) => { const d = String(p).replace(/\D/g, ''); return d.length === 10 ? '91' + d : d }
 const setOtp = (phone, code) => { const ex = find('otps', (o) => o.phone === phone); if (ex) { ex.code = code; ex.t = Date.now(); persist('otps', ex) } else insert('otps', { id: uuid(), phone, code, t: Date.now() }) }
 
+// ---- Test-number demo OTP (founder / QA only). Set DEMO_OTP_PHONES="+91XXXXXXXXXX,+91YYYYYYYYYY" in env.
+// Only those phones accept the fixed DEMO_OTP_CODE (default 7291); everyone else keeps real SMS OTP.
+// The code is NEVER returned to the client. Empty DEMO_OTP_PHONES = feature inactive (secure default).
+const DEMO_OTP_CODE = process.env.DEMO_OTP_CODE || '7291'
+const DEMO_OTP_PHONES = (process.env.DEMO_OTP_PHONES || '').split(',').map((p) => toMobile(p.trim())).filter(Boolean)
+const isDemoPhone = (phone) => DEMO_OTP_PHONES.length > 0 && DEMO_OTP_PHONES.includes(toMobile(phone))
+if (DEMO_OTP_PHONES.length) console.log('Demo OTP enabled for ' + DEMO_OTP_PHONES.length + ' test number(s).')
+
 async function otpSend(phone) {
+  // test-number allowlist: fixed code, no SMS, code not exposed to the client.
+  if (isDemoPhone(phone)) { setOtp(phone, DEMO_OTP_CODE); return { sent: true, channel: 'demo-test' } }
   // otp_disabled: phone is still required, but no code is sent or checked (beta unblocker).
   if (AUTH_MODE === 'otp_disabled') return { sent: true, channel: 'disabled', mode: 'otp_disabled' }
   // otp_demo: fixed code, no real SMS.
@@ -588,6 +598,8 @@ async function otpSend(phone) {
   throw new Error('OTP provider not configured. Set SMS_* env or switch AUTH_MODE.')
 }
 async function otpVerify(phone, code) {
+  // test-number allowlist: compare against the fixed code stored at send time.
+  if (isDemoPhone(phone)) { const rec = find('otps', (o) => o.phone === phone); return !!(rec && rec.code === String(code).trim()) }
   // otp_disabled: accept without a code (phone-only registration).
   if (AUTH_MODE === 'otp_disabled') return true
   if (AUTH_MODE === 'otp_demo') { const rec = find('otps', (o) => o.phone === phone); return !!(rec && rec.code === String(code).trim()) }
